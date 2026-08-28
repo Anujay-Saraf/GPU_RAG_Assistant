@@ -272,7 +272,7 @@ def contextualize_pronouns(
       model_name = (
           "gpt-4o-mini"
           if provider == "openai"
-          else "meta-llama/llama-3.3-70b-instruct:free"
+          else "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
       )
       res = client.chat.completions.create(
           model=model_name,

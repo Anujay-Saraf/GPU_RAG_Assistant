@@ -33,6 +33,7 @@ def get_secret(key: str, default: str = "") -> str:
 
 ADMIN_PASSKEY = get_secret("ADMIN_SECRET_KEY", "admin-enterprise-key-2026")
 
+
 # -------------------------------------------------------------
 # Dynamic Auto-Free Model Discovery for OpenRouter
 # -------------------------------------------------------------
@@ -115,7 +116,7 @@ embedder, reranker, chroma_client, collection, embed_fn = load_neural_models()
 
 
 # -------------------------------------------------------------
-# Knowledge Base State & Helpers
+# Knowledge Base State & Ingestion Engine
 # -------------------------------------------------------------
 def get_indexed_inventory():
   try:
@@ -132,6 +133,7 @@ def get_indexed_inventory():
             "pages": int(m.get("page", 1)),
             "file_size": m.get("file_size", 0),
             "chunks": 1,
+            "uploader": m.get("uploader", "system"),
         }
       else:
         doc_summary[src]["pages"] = max(
@@ -158,6 +160,72 @@ def update_bm25_index():
       st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
   except Exception as e:
     logger.warning(f"BM25 index update error: {e}")
+
+
+def ingest_pdf_files(
+    uploaded_files: list, uploader_role: str = "user"
+) -> tuple[int, list]:
+  """Parses, chunks, embeds, and stores uploaded PDFs with duplicate checks."""
+  splitter = RecursiveCharacterTextSplitter(chunk_size=512, chunk_overlap=64)
+  indexed_count = 0
+  skipped_files = []
+  current_inventory = get_indexed_inventory()
+
+  for f in uploaded_files:
+    file_bytes = f.read()
+    file_size = len(file_bytes)
+
+    # Duplicate check: same filename and size
+    if (
+        f.name in current_inventory
+        and current_inventory[f.name]["file_size"] == file_size
+    ):
+      skipped_files.append(f.name)
+      continue
+
+    # If updated, purge previous version of this file
+    if f.name in current_inventory:
+      try:
+        collection.delete(where={"source": f.name})
+      except Exception:
+        pass
+
+    all_chunks = []
+    try:
+      reader = PdfReader(io.BytesIO(file_bytes))
+      for idx, page in enumerate(reader.pages):
+        txt = page.extract_text()
+        if txt and len(txt.strip()) > 10:
+          for chunk in splitter.split_text(txt.strip()):
+            all_chunks.append({
+                "text": chunk,
+                "meta": {
+                    "source": f.name,
+                    "page": idx + 1,
+                    "file_size": file_size,
+                    "uploader": uploader_role,
+                },
+            })
+    except Exception as e:
+      logger.error(f"Error parsing {f.name}: {e}")
+      continue
+
+    if all_chunks:
+      batch_size = 64
+      for i in range(0, len(all_chunks), batch_size):
+        batch = all_chunks[i : i + batch_size]
+        collection.upsert(
+            documents=[c["text"] for c in batch],
+            metadatas=[c["meta"] for c in batch],
+            ids=[
+                f"{f.name}_{uuid.uuid4().hex[:8]}_{j}"
+                for j in range(i, i + len(batch))
+            ],
+        )
+      indexed_count += len(all_chunks)
+
+  update_bm25_index()
+  return indexed_count, skipped_files
 
 
 def get_active_api_key(provider: str) -> str:
@@ -438,23 +506,51 @@ RULES:
 # =============================================================
 def render_user_page():
   st.title("⚡ Enterprise Knowledge Assistant")
-  st.caption("Grounded Hybrid RAG | Multi-Document In-Memory Verification")
+  st.caption("Real-Time RAG | Live Document Ingestion & Verification")
 
   if "user_messages" not in st.session_state:
     st.session_state.user_messages = []
 
-  # Sidebar: Document Selection Only (No API credentials or upload UI)
+  # Sidebar: Document Upload + Active Document Filtering
   with st.sidebar:
-    st.subheader("📚 Available Documents")
+    st.subheader("📤 Upload Documents (Real-Time RAG)")
+    user_uploaded_files = st.file_uploader(
+        "Upload PDF Files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="user_file_uploader",
+    )
+
+    if (
+        st.button(
+            "⚡ Index My Documents",
+            use_container_width=True,
+            key="user_index_btn",
+        )
+        and user_uploaded_files
+    ):
+      with st.status("Ingesting & Indexing PDF(s)...", expanded=True) as box:
+        count, skipped = ingest_pdf_files(
+            user_uploaded_files, uploader_role="user"
+        )
+        box.update(
+            label=f"Done! ({count} chunks indexed, {len(skipped)} duplicates bypassed)",
+            state="complete",
+        )
+        st.success(f"Added {len(user_uploaded_files)} document(s) to RAG!")
+        st.rerun()
+
+    st.markdown("---")
+    st.subheader("📚 Available Knowledge Base")
     current_inventory = get_indexed_inventory()
 
     if current_inventory:
       doc_names = list(current_inventory.keys())
       selected_docs = st.multiselect(
-          "Filter Search Target:",
+          "Filter Search Targets:",
           options=doc_names,
           default=doc_names,
-          help="Select which indexed documents to query.",
+          help="Choose which documents the assistant will search against.",
       )
       for name, info in current_inventory.items():
         size_kb = (
@@ -468,7 +564,7 @@ def render_user_page():
         )
     else:
       selected_docs = []
-      st.info("No documents are currently indexed.")
+      st.info("No documents currently indexed. Upload above to begin!")
 
   # Render Chat Messages
   for msg in st.session_state.user_messages:
@@ -483,7 +579,7 @@ def render_user_page():
         with st.expander("📚 Evidence & Verification Audit"):
           st.markdown(msg["metrics_md"])
 
-  prompt = st.chat_input("Ask a question across indexed documents...")
+  prompt = st.chat_input("Ask a question across your indexed documents...")
 
   if prompt:
     st.session_state.user_messages.append({"role": "user", "content": prompt})
@@ -513,7 +609,10 @@ def render_user_page():
       if any(re.search(p, prompt.lower()) for p in catalog_patterns):
         inv = get_indexed_inventory()
         if not inv:
-          summary = "The knowledge base is currently empty."
+          summary = (
+              "The knowledge base is currently empty. Please upload PDF files in"
+              " the sidebar."
+          )
         else:
           lines = ["Here is the inventory of indexed documents:\n"]
           for idx, (doc_name, dinfo) in enumerate(inv.items(), 1):
@@ -540,8 +639,8 @@ def render_user_page():
       if collection.count() == 0:
         status_box.update(label="⚠️ Knowledge Base Empty", state="error")
         resp_ph.error(
-            "No documents have been indexed yet. Please notify the"
-            " administrator."
+            "No documents have been indexed yet. Please upload PDF files in the"
+            " sidebar."
         )
         st.stop()
 
@@ -717,7 +816,6 @@ def render_admin_page():
         st.error("Invalid passkey.")
     return
 
-  # Authenticated Admin Interface
   col_a, col_b = st.columns([4, 1])
   with col_b:
     if st.button("🔒 Logout Admin", use_container_width=True):
@@ -758,84 +856,21 @@ def render_admin_page():
       st.success("Key applied for this active session.")
 
   with tab2:
-    st.subheader("Upload & Index Documents")
-    uploaded_files = st.file_uploader(
-        "Upload PDF Files", type=["pdf"], accept_multiple_files=True
+    st.subheader("Upload & Index Documents (Admin Authority)")
+    admin_files = st.file_uploader(
+        "Upload PDF Files",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="admin_file_uploader",
     )
 
-    if (
-        st.button("Process & Index", use_container_width=True)
-        and uploaded_files
-    ):
-      splitter = RecursiveCharacterTextSplitter(
-          chunk_size=512, chunk_overlap=64
-      )
-      indexed_count = 0
-      skipped_files = []
-      current_inventory = get_indexed_inventory()
-
+    if st.button("Process & Index", use_container_width=True) and admin_files:
       with st.status("Indexing documents...", expanded=True) as status_box:
-        for f in uploaded_files:
-          file_bytes = f.read()
-          file_size = len(file_bytes)
-
-          if (
-              f.name in current_inventory
-              and current_inventory[f.name]["file_size"] == file_size
-          ):
-            st.write(
-                f"⏩ **Bypassed duplicate:** `{f.name}` (Already indexed)"
-            )
-            skipped_files.append(f.name)
-            continue
-
-          if f.name in current_inventory:
-            st.write(f"🔄 **Updating modified file:** `{f.name}`...")
-            try:
-              collection.delete(where={"source": f.name})
-            except Exception:
-              pass
-
-          st.write(f"📖 Parsing `{f.name}`...")
-          all_chunks = []
-          try:
-            reader = PdfReader(io.BytesIO(file_bytes))
-            for idx, page in enumerate(reader.pages):
-              txt = page.extract_text()
-              if txt and len(txt.strip()) > 10:
-                for chunk in splitter.split_text(txt.strip()):
-                  all_chunks.append({
-                      "text": chunk,
-                      "meta": {
-                          "source": f.name,
-                          "page": idx + 1,
-                          "file_size": file_size,
-                      },
-                  })
-          except Exception as e:
-            st.error(f"Error parsing {f.name}: {e}")
-            continue
-
-          if all_chunks:
-            batch_size = 64
-            for i in range(0, len(all_chunks), batch_size):
-              batch = all_chunks[i : i + batch_size]
-              collection.upsert(
-                documents=[c["text"] for c in batch],
-                metadatas=[c["meta"] for c in batch],
-                ids=[
-                    f"{f.name}_{uuid.uuid4().hex[:8]}_{j}"
-                    for j in range(i, i + len(batch))
-                ],
-              )
-            indexed_count += len(all_chunks)
-            st.write(f"✅ Indexed `{f.name}` ({len(all_chunks)} chunks)")
-
-        update_bm25_index()
+        count, skipped = ingest_pdf_files(admin_files, uploader_role="admin")
         status_box.update(
             label=(
-                f"Completed: {indexed_count} new chunks indexed,"
-                f" {len(skipped_files)} duplicate files skipped."
+                f"Completed: {count} new chunks indexed,"
+                f" {len(skipped)} duplicate files skipped."
             ),
             state="complete",
         )
@@ -853,7 +888,7 @@ def render_admin_page():
         )
         st.write(
             f"- **`{name}`** (~{info['pages']} pages | {info['chunks']} chunks"
-            f" | {size_kb} KB)"
+            f" | {size_kb} KB | Tag: `{info.get('uploader', 'system')}`)"
         )
 
       if st.button("🗑️ Wipe Entire Database", use_container_width=True):

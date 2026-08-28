@@ -29,7 +29,7 @@ RULES FOR CODE & EXPLANATIONS:
 
 # Free models prioritized on OpenRouter
 OPENROUTER_FREE_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
+    "nvidia/llama-nemotron-rerank-vl-1b-v2:free",
     "meta-llama/llama-3.2-3b-instruct:free",
     "google/gemini-2.0-flash-exp:free",
     "qwen/qwen-2.5-72b-instruct:free",
@@ -280,4 +280,3 @@ class LLMService:
                         except Exception:
                             continue
             yield f"\n\n❌ **Provider Generation Error ({provider} - {model}):** {str(e)}"
-            

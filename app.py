@@ -19,6 +19,38 @@ import streamlit as st
 
 logger = logging.getLogger("EnterpriseRAG")
 
+# -------------------------------------------------------------
+# Secret Resolution Helper (Streamlit Secrets / Env Vars)
+# -------------------------------------------------------------
+def get_secret(key: str, default: str = "") -> str:
+  try:
+    if key in st.secrets:
+      return str(st.secrets[key])
+  except Exception:
+    pass
+  return os.getenv(key, default)
+
+
+ADMIN_PASSKEY = get_secret("ADMIN_SECRET_KEY", "admin-enterprise-key-2026")
+
+# -------------------------------------------------------------
+# Streamlit Page Setup & Session State
+# -------------------------------------------------------------
+st.set_page_config(
+    page_title="Enterprise Intelligence Portal", page_icon="⚡", layout="wide"
+)
+
+if "session_id" not in st.session_state:
+  st.session_state.session_id = str(uuid.uuid4())
+if "messages" not in st.session_state:
+  st.session_state.messages = []
+if "bm25_cache" not in st.session_state:
+  st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
+if "is_admin" not in st.session_state:
+  st.session_state.is_admin = False
+if "active_provider" not in st.session_state:
+  st.session_state.active_provider = get_secret("ACTIVE_PROVIDER", "openrouter")
+
 
 # -------------------------------------------------------------
 # Dynamic Auto-Free Model Discovery for OpenRouter
@@ -36,7 +68,6 @@ def get_dynamic_free_models() -> list:
         data = json.loads(resp.read().decode())
         models = data.get("data", [])
 
-        # Filter strictly for free tier endpoints (free suffix or 0-cost pricing)
         free_slugs = []
         for m in models:
           model_id = m.get("id", "")
@@ -46,7 +77,6 @@ def get_dynamic_free_models() -> list:
               and str(pricing.get("completion", "")).strip() in ["0", "0.0"]
           )
           if model_id.endswith(":free") or is_zero_cost:
-            # Exclude non-text/reranker models
             if not any(
                 bad in model_id.lower()
                 for bad in ["rerank", "embed", "guard", "moderation"]
@@ -58,28 +88,12 @@ def get_dynamic_free_models() -> list:
   except Exception as e:
     logger.warning(f"Could not reach OpenRouter models API: {e}")
 
-  # Resilient generic fallback slugs if network lookup fails
   return [
       "google/gemini-2.0-flash-exp:free",
       "meta-llama/llama-3.2-3b-instruct:free",
       "meta-llama/llama-3.1-8b-instruct:free",
       "mistralai/mistral-7b-instruct:free",
   ]
-
-
-# -------------------------------------------------------------
-# Streamlit Page Setup
-# -------------------------------------------------------------
-st.set_page_config(
-    page_title="Enterprise Intelligence Portal", page_icon="⚡", layout="wide"
-)
-
-if "session_id" not in st.session_state:
-  st.session_state.session_id = str(uuid.uuid4())
-if "messages" not in st.session_state:
-  st.session_state.messages = []
-if "bm25_cache" not in st.session_state:
-  st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
 
 
 # -------------------------------------------------------------
@@ -166,6 +180,21 @@ def update_bm25_index():
       st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
   except Exception as e:
     logger.warning(f"BM25 index update error: {e}")
+
+
+def get_active_api_key(provider: str) -> str:
+  """Retrieves the active API key without exposing it to regular users."""
+  # 1. Admin session override
+  if st.session_state.get(f"admin_{provider}_key"):
+    return st.session_state[f"admin_{provider}_key"]
+  # 2. Streamlit Cloud Secrets / Environment Variables
+  if provider == "openrouter":
+    return get_secret("OPENROUTER_API_KEY")
+  elif provider == "gemini":
+    return get_secret("GEMINI_API_KEY")
+  elif provider == "openai":
+    return get_secret("OPENAI_API_KEY")
+  return ""
 
 
 # -------------------------------------------------------------
@@ -311,19 +340,17 @@ def contextualize_pronouns(
       model = genai.GenerativeModel("gemini-1.5-flash")
       res = model.generate_content(prompt)
       return res.text.strip().strip('"')
-    elif provider == "openai" and api_key:
-      client = openai.OpenAI(api_key=api_key)
-      res = client.chat.completions.create(
-          model="gpt-4o-mini",
-          messages=[{"role": "user", "content": prompt}],
-          max_tokens=60,
+    elif provider in ["openai", "openrouter"] and api_key:
+      base_url = (
+          "https://openrouter.ai/api/v1" if provider == "openrouter" else None
       )
-      return res.choices[0].message.content.strip().strip('"')
-    elif provider == "openrouter" and api_key:
-      client = openai.OpenAI(
-          api_key=api_key, base_url="https://openrouter.ai/api/v1"
+      client = openai.OpenAI(api_key=api_key, base_url=base_url)
+      available_models = (
+          ["gpt-4o-mini"]
+          if provider == "openai"
+          else get_dynamic_free_models()
       )
-      for model_name in get_dynamic_free_models():
+      for model_name in available_models:
         try:
           res = client.chat.completions.create(
               model=model_name,
@@ -343,8 +370,8 @@ def stream_llm(
 ):
   if not api_key:
     yield (
-        "⚠️ **Error:** Missing API Key. Please enter your API key in the sidebar"
-        " configuration."
+        "⚠️ **Error:** Backend API credentials not configured. Please contact"
+        " the administrator."
     )
     return
 
@@ -381,7 +408,6 @@ def stream_llm(
       live_free_models = get_dynamic_free_models()
       streamed = False
 
-      # Try each live free model in priority order
       for candidate_model in live_free_models:
         try:
           stream = client.chat.completions.create(
@@ -401,16 +427,16 @@ def stream_llm(
             break
         except Exception as model_err:
           logger.warning(
-              f"OpenRouter free candidate [{candidate_model}] unavailable:"
+              f"OpenRouter free candidate [{candidate_model}] failed:"
               f" {model_err}"
           )
           continue
 
       if not streamed:
-        yield "\n\n❌ **OpenRouter Auto-Free Error:** All currently active free models failed to respond. Please verify your OpenRouter API key or switch to Gemini."
+        yield "\n\n❌ **Provider Error:** All free model endpoints are currently congested. Please retry in a few moments."
 
   except Exception as e:
-    yield f"\n\n❌ **API Error ({provider}):** {str(e)}"
+    yield f"\n\n❌ **Generation Error:** {str(e)}"
 
 
 # -------------------------------------------------------------
@@ -432,52 +458,134 @@ RULES:
 3. Do NOT include bracketed citation numbers like [1] or [2]."""
 
 # -------------------------------------------------------------
-# Sidebar: Ingestion & Document Selection
+# Sidebar: Role-Based Access Control (Admin vs. User Persona)
 # -------------------------------------------------------------
 with st.sidebar:
-  st.title("⚙️ Control Center")
-
-  provider = st.selectbox(
-      "LLM Provider",
-      ["openrouter", "gemini", "openai"],
-      index=0,
-      format_func=lambda x: "OpenRouter (Auto Free Router)"
-      if x == "openrouter"
-      else (
-          "Google Gemini (gemini-1.5-flash)"
-          if x == "gemini"
-          else "OpenAI (gpt-4o-mini)"
-      ),
-  )
-  api_key = st.text_input(
-      f"{provider.capitalize()} API Key",
-      type="password",
-      help="Enter your API key.",
-  )
+  # Persona Status Indicator
+  if st.session_state.is_admin:
+    st.success("👑 **Admin Workspace Active**")
+  else:
+    st.info("👤 **User Mode**")
 
   st.markdown("---")
 
-  st.subheader("📚 Available Knowledge Base")
-  current_inventory = get_indexed_inventory()
+  # 1. ADMIN MODE CONTROLS (Only visible when unlocked)
+  if st.session_state.is_admin:
+    st.subheader("⚙️ System Configuration")
 
-  if current_inventory:
-    doc_names = list(current_inventory.keys())
-    selected_docs = st.multiselect(
-        "Target Documents for Queries:",
-        options=doc_names,
-        default=doc_names,
-        help="Select all or specific files to focus the RAG search.",
+    provider_options = ["openrouter", "gemini", "openai"]
+    provider_labels = {
+        "openrouter": "OpenRouter (Auto Free)",
+        "gemini": "Google Gemini (gemini-1.5-flash)",
+        "openai": "OpenAI (gpt-4o-mini)",
+    }
+    st.session_state.active_provider = st.selectbox(
+        "Active LLM Provider",
+        provider_options,
+        index=provider_options.index(st.session_state.active_provider)
+        if st.session_state.active_provider in provider_options
+        else 0,
+        format_func=lambda x: provider_labels.get(x, x),
     )
-    for name, info in current_inventory.items():
-      size_kb = (
-          round(info["file_size"] / 1024, 1) if info["file_size"] > 0 else "N/A"
-      )
-      st.caption(
-          f"📄 **{name}** (~{info['pages']} pgs | {info['chunks']} chunks |"
-          f" {size_kb} KB)"
-      )
 
-    if st.button("🗑️ Clear Entire Database", use_container_width=True):
+    override_key = st.text_input(
+        f"{st.session_state.active_provider.capitalize()} API Key Override",
+        type="password",
+        value=st.session_state.get(
+            f"admin_{st.session_state.active_provider}_key", ""
+        ),
+        help="Leave empty to use default secrets/environment variables.",
+    )
+    if override_key:
+      st.session_state[
+          f"admin_{st.session_state.active_provider}_key"
+      ] = override_key
+
+    st.markdown("---")
+    st.subheader("📤 Document Management")
+    uploaded_files = st.file_uploader(
+        "Upload PDF Documents", type=["pdf"], accept_multiple_files=True
+    )
+
+    if (
+        st.button("Process & Index", use_container_width=True)
+        and uploaded_files
+    ):
+      splitter = RecursiveCharacterTextSplitter(
+          chunk_size=512, chunk_overlap=64
+      )
+      indexed_count = 0
+      skipped_files = []
+      current_inventory = get_indexed_inventory()
+
+      with st.status("Indexing documents...", expanded=True) as status_box:
+        for f in uploaded_files:
+          file_bytes = f.read()
+          file_size = len(file_bytes)
+
+          if (
+              f.name in current_inventory
+              and current_inventory[f.name]["file_size"] == file_size
+          ):
+            st.write(
+                f"⏩ **Bypassed duplicate:** `{f.name}` (Already fully indexed)"
+            )
+            skipped_files.append(f.name)
+            continue
+
+          if f.name in current_inventory:
+            st.write(f"🔄 **Updating modified file:** `{f.name}`...")
+            try:
+              collection.delete(where={"source": f.name})
+            except Exception:
+              pass
+
+          st.write(f"📖 Parsing `{f.name}`...")
+          all_chunks = []
+          try:
+            reader = PdfReader(io.BytesIO(file_bytes))
+            for idx, page in enumerate(reader.pages):
+              txt = page.extract_text()
+              if txt and len(txt.strip()) > 10:
+                for chunk in splitter.split_text(txt.strip()):
+                  all_chunks.append({
+                      "text": chunk,
+                      "meta": {
+                          "source": f.name,
+                          "page": idx + 1,
+                          "file_size": file_size,
+                      },
+                  })
+          except Exception as e:
+            st.error(f"Error parsing {f.name}: {e}")
+            continue
+
+          if all_chunks:
+            batch_size = 64
+            for i in range(0, len(all_chunks), batch_size):
+              batch = all_chunks[i : i + batch_size]
+              collection.upsert(
+                  documents=[c["text"] for c in batch],
+                  metadatas=[c["meta"] for c in batch],
+                  ids=[
+                      f"{f.name}_{uuid.uuid4().hex[:8]}_{j}"
+                      for j in range(i, i + len(batch))
+                  ],
+              )
+            indexed_count += len(all_chunks)
+            st.write(f"✅ Indexed `{f.name}` ({len(all_chunks)} chunks)")
+
+        update_bm25_index()
+        status_box.update(
+            label=(
+                f"Done! ({indexed_count} new chunks indexed,"
+                f" {len(skipped_files)} skipped)"
+            ),
+            state="complete",
+        )
+        st.rerun()
+
+    if st.button("🗑️ Wipe Entire Database", use_container_width=True):
       try:
         chroma_client.delete_collection("general_knowledge_base")
       except Exception:
@@ -491,90 +599,60 @@ with st.sidebar:
       st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
       st.success("Knowledge base cleared.")
       st.rerun()
-  else:
-    selected_docs = []
-    st.info("No documents currently indexed.")
 
-  st.markdown("---")
-
-  st.subheader("📤 Upload New Documents")
-  uploaded_files = st.file_uploader(
-      "Upload PDF Documents", type=["pdf"], accept_multiple_files=True
-  )
-
-  if st.button("Process & Index", use_container_width=True) and uploaded_files:
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=512, chunk_overlap=64
-    )
-    indexed_count = 0
-    skipped_files = []
-
-    with st.status("Indexing documents...", expanded=True) as status_box:
-      for f in uploaded_files:
-        file_bytes = f.read()
-        file_size = len(file_bytes)
-
-        if (
-            f.name in current_inventory
-            and current_inventory[f.name]["file_size"] == file_size
-        ):
-          st.write(
-              f"⏩ **Bypassed duplicate:** `{f.name}` (Already fully indexed)"
-          )
-          skipped_files.append(f.name)
-          continue
-
-        if f.name in current_inventory:
-          st.write(f"🔄 **Updating modified file:** `{f.name}`...")
-          try:
-            collection.delete(where={"source": f.name})
-          except Exception:
-            pass
-
-        st.write(f"📖 Parsing & Chunking `{f.name}`...")
-        all_chunks = []
-        try:
-          reader = PdfReader(io.BytesIO(file_bytes))
-          for idx, page in enumerate(reader.pages):
-            txt = page.extract_text()
-            if txt and len(txt.strip()) > 10:
-              for chunk in splitter.split_text(txt.strip()):
-                all_chunks.append({
-                    "text": chunk,
-                    "meta": {
-                        "source": f.name,
-                        "page": idx + 1,
-                        "file_size": file_size,
-                    },
-                })
-        except Exception as e:
-          st.error(f"Error parsing {f.name}: {e}")
-          continue
-
-        if all_chunks:
-          batch_size = 64
-          for i in range(0, len(all_chunks), batch_size):
-            batch = all_chunks[i : i + batch_size]
-            collection.upsert(
-                documents=[c["text"] for c in batch],
-                metadatas=[c["meta"] for c in batch],
-                ids=[
-                    f"{f.name}_{uuid.uuid4().hex[:8]}_{j}"
-                    for j in range(i, i + len(batch))
-                ],
-            )
-          indexed_count += len(all_chunks)
-          st.write(f"✅ Indexed `{f.name}` ({len(all_chunks)} chunks)")
-
-      update_bm25_index()
-      status_box.update(
-          label=(
-              f"Done! ({indexed_count} new chunks indexed,"
-              f" {len(skipped_files)} skipped)"
-          ),
-          state="complete",
-      )
+    if st.button("🔒 Logout Admin", use_container_width=True):
+      st.session_state.is_admin = False
       st.rerun()
+
+  # 2. USER MODE CONTROLS (What standard visitors see)
+  else:
+    st.subheader("📚 Knowledge Base")
+    current_inventory = get_indexed_inventory()
+
+    if current_inventory:
+      doc_names = list(current_inventory.keys())
+      selected_docs = st.multiselect(
+          "Filter Search Across Documents:",
+          options=doc_names,
+          default=doc_names,
+          help="Choose which documents the assistant will search against.",
+      )
+      for name, info in current_inventory.items():
+        size_kb = (
+            round(info["file_size"] / 1024, 1)
+            if info["file_size"] > 0
+            else "N/A"
+        )
+        st.caption(
+            f"📄 **{name}** (~{info['pages']} pgs | {info['chunks']} chunks |"
+            f" {size_kb} KB)"
+        )
+    else:
+      selected_docs = []
+      st.info(
+          "No documents currently indexed. Contact the administrator to load"
+          " materials."
+      )
+
+    st.markdown("---")
+
+    # Admin Login Expander
+    with st.expander("🔐 Admin Login"):
+      admin_input = st.text_input(
+          "Admin Passkey", type="password", key="admin_auth_box"
+      )
+      if st.button("Unlock Admin Mode", use_container_width=True):
+        if admin_input == ADMIN_PASSKEY:
+          st.session_state.is_admin = True
+          st.success("Admin mode unlocked.")
+          st.rerun()
+        else:
+          st.error("Invalid passkey.")
+
+# Ensure selected_docs exists in session for user/admin queries
+if st.session_state.is_admin:
+  inv = get_indexed_inventory()
+  selected_docs = list(inv.keys()) if inv else []
 
 # -------------------------------------------------------------
 # Main Chat Workspace
@@ -585,6 +663,7 @@ st.caption(
     " Audits"
 )
 
+# Render Chat History
 for msg in st.session_state.messages:
   with st.chat_message(msg["role"]):
     if msg.get("mode") == "general_knowledge":
@@ -613,6 +692,10 @@ if prompt:
     metrics_md = ""
     final_mode = "grounded_rag"
 
+    # Resolve active credentials silently
+    active_prov = st.session_state.active_provider
+    active_key = get_active_api_key(active_prov)
+
     # 1. Catalog / Document Inventory Check
     catalog_patterns = [
         r"which (all )?(notes|docs|documents|files|pdfs)",
@@ -622,10 +705,7 @@ if prompt:
     if any(re.search(p, prompt.lower()) for p in catalog_patterns):
       inv = get_indexed_inventory()
       if not inv:
-        summary = (
-            "The knowledge base is currently empty. Please upload PDF files in"
-            " the sidebar."
-        )
+        summary = "The knowledge base is currently empty."
       else:
         lines = ["Here is the inventory of indexed documents:\n"]
         for idx, (doc_name, dinfo) in enumerate(inv.items(), 1):
@@ -645,15 +725,15 @@ if prompt:
     # 2. Contextualization & Sub-Query Expansion
     status_box.update(label="🧠 Expanding query intent...", state="running")
     standalone_query = contextualize_pronouns(
-        st.session_state.messages[:-1], prompt, provider, api_key
+        st.session_state.messages[:-1], prompt, active_prov, active_key
     )
     sub_queries = expand_query(standalone_query)
 
     if collection.count() == 0:
       status_box.update(label="⚠️ Knowledge Base Empty", state="error")
       resp_ph.error(
-          "No documents have been indexed yet. Please upload PDF files in the"
-          " sidebar."
+          "No documents have been indexed yet. Please ask an administrator to"
+          " upload materials."
       )
       st.stop()
 
@@ -705,7 +785,7 @@ if prompt:
       )
 
       for chunk in stream_llm(
-          provider, api_key, GENERAL_FALLBACK_SYSTEM_PROMPT, user_prompt
+          active_prov, active_key, GENERAL_FALLBACK_SYSTEM_PROMPT, user_prompt
       ):
         full_response += chunk
         resp_ph.markdown(full_response + "▌")
@@ -744,7 +824,7 @@ if prompt:
         )
 
       for chunk in stream_llm(
-          provider, api_key, GROUNDED_SYSTEM_PROMPT, user_prompt
+          active_prov, active_key, GROUNDED_SYSTEM_PROMPT, user_prompt
       ):
         full_response += chunk
         resp_ph.markdown(full_response + "▌")

@@ -185,7 +185,6 @@ def ingest_pdf_files(
     file_bytes = f.read()
     file_size = len(file_bytes)
 
-    # Duplicate check: exact filename and byte size
     if (
         f.name in current_inventory
         and current_inventory[f.name]["file_size"] == file_size
@@ -193,7 +192,6 @@ def ingest_pdf_files(
       skipped_files.append(f.name)
       continue
 
-    # Purge existing older chunks if updated
     if f.name in current_inventory:
       try:
         collection.delete(where={"source": f.name})
@@ -239,15 +237,9 @@ def ingest_pdf_files(
 
 
 # -------------------------------------------------------------
-# Multi-Tiered Credential & Provider Resolver
+# Multi-Tiered Credential Resolver
 # -------------------------------------------------------------
 def resolve_effective_provider_and_key() -> tuple[str, str, str]:
-  """Resolves active provider and API key with hierarchical priority:
-
-  1. User Session Override (BYOK)
-  2. Admin Session Override
-  3. Streamlit Cloud Secrets / Environment Variables
-  """
   user_override_prov = st.session_state.get("user_selected_provider")
   user_key = st.session_state.get("user_custom_api_key", "").strip()
 
@@ -542,7 +534,6 @@ def render_user_page():
 
   # Sidebar: Document Upload + BYOK Settings + Target Selector
   with st.sidebar:
-    # 1. User API Key & Provider Override (BYOK)
     with st.expander("🔑 BYOK: Custom API Key (Optional)", expanded=False):
       st.caption("Override system credentials for your session:")
       user_provider_choice = st.selectbox(
@@ -571,7 +562,6 @@ def render_user_page():
         st.session_state.pop("user_selected_provider", None)
         st.rerun()
 
-    # Active Credential Badge
     active_prov, active_key, key_src = resolve_effective_provider_and_key()
     if active_key:
       st.success(f"🟢 Engine: **{active_prov.upper()}** ({key_src})")
@@ -579,8 +569,6 @@ def render_user_page():
       st.info("🟡 Engine: **Extractive Fallback Mode** (No API Key)")
 
     st.markdown("---")
-
-    # 2. Document Upload for Real-Time Ingestion
     st.subheader("📤 Upload Documents")
     user_uploaded_files = st.file_uploader(
         "Upload PDF Files",
@@ -612,8 +600,6 @@ def render_user_page():
         st.rerun()
 
     st.markdown("---")
-
-    # 3. Target Document Selector
     st.subheader("📚 Available Knowledge Base")
     current_inventory = get_indexed_inventory()
 
@@ -639,35 +625,40 @@ def render_user_page():
       selected_docs = []
       st.info("No documents currently indexed. Upload above to begin!")
 
-  # -------------------------------------------------------------
-  # Parallel Dual-Column Layout: Chat on Left, Citations on Right
-  # -------------------------------------------------------------
+  # Dual-Column Layout
   col_chat, col_citations = st.columns([3, 2], gap="large")
 
+  # ---------------- LEFT COLUMN: Conversational Chat ----------------
   with col_chat:
     st.title("⚡ Knowledge Chat")
     st.caption("Grounded Multi-Document RAG Workspace")
 
-    # Render Chat History
-    for msg in st.session_state.user_messages:
-      with st.chat_message(msg["role"]):
-        if msg.get("mode") == "general_knowledge":
-          st.info(
-              "💡 **Answered from General AI Knowledge** *(Topic not found in"
-              " selected documents)*"
-          )
-        elif msg.get("mode") == "extractive_fallback":
-          st.warning(
-              "ℹ️ **Extractive Fallback Mode:** Direct verified passages from"
-              " your documents."
-          )
-        st.markdown(msg["content"])
+    chat_placeholder = st.container()
+    with chat_placeholder:
+      for msg in st.session_state.user_messages:
+        with st.chat_message(msg["role"]):
+          if msg.get("mode") == "general_knowledge":
+            st.info(
+                "💡 **Answered from General AI Knowledge** *(Not found in"
+                " selected documents)*"
+            )
+          elif msg.get("mode") == "extractive_fallback":
+            st.warning(
+                "ℹ️ **Extractive Fallback Mode:** Direct verified passages from"
+                " documents."
+            )
+          st.markdown(msg["content"])
 
+          # Wrapped Citations (collapsed by default until opened)
+          if msg.get("metrics_md"):
+            with st.expander("📚 View Citations & Evidence", expanded=False):
+              st.markdown(msg["metrics_md"])
+
+  # ---------------- RIGHT COLUMN: Parallel Citations Inspector ----------------
   with col_citations:
-    st.title("📚 Citations & Audits")
-    st.caption("Live Evidence Verification (Wrapped by Default)")
+    st.title("📚 Live Citations & Evidence")
+    st.caption("Document Grounding Audits (Wrapped by Default)")
 
-    # Render previous citation audits inside collapsed expanders
     assistant_turns = [
         m
         for m in st.session_state.user_messages
@@ -675,21 +666,33 @@ def render_user_page():
     ]
     if not assistant_turns:
       st.info(
-          "Citations and evidence audits will appear here in parallel as you"
+          "Citations and evidence audits will populate here in parallel as you"
           " query your documents."
       )
     else:
-      for idx, turn in enumerate(assistant_turns, 1):
-        q_label = turn.get("query_preview", f"Turn #{idx}")
-        # Kept collapsed (expanded=False) until user explicitly clicks to view
-        with st.expander(f"🔍 Citation Audit: {q_label}", expanded=False):
-          st.markdown(turn["metrics_md"])
+      # Most recent question's citation is ready for user exploration
+      latest_turn = assistant_turns[-1]
+      st.markdown(
+          f"#### Latest Query: *\"{latest_turn.get('query_preview', 'Latest')}\"*"
+      )
+      with st.expander(
+          "🔍 Inspect Evidence & Neural Confidence", expanded=False
+      ):
+        st.markdown(latest_turn["metrics_md"])
 
-  # Input Box
+      # Collapsed history of earlier turns
+      if len(assistant_turns) > 1:
+        st.markdown("---")
+        st.markdown("##### 📜 Previous Query Audits")
+        for idx, turn in enumerate(reversed(assistant_turns[:-1]), 1):
+          q_prev = turn.get("query_preview", f"Turn #{len(assistant_turns)-idx}")
+          with st.expander(f"Audit: {q_prev}", expanded=False):
+            st.markdown(turn["metrics_md"])
+
+  # ---------------- CHAT INPUT HANDLING ----------------
   prompt = st.chat_input("Ask a question across your indexed documents...")
 
   if prompt:
-    # Append user question to history
     st.session_state.user_messages.append({"role": "user", "content": prompt})
 
     with col_chat:
@@ -697,7 +700,7 @@ def render_user_page():
         st.markdown(prompt)
 
       with st.chat_message("assistant"):
-        status_box = st.status("Analyzing...", expanded=True)
+        status_box = st.status("Analyzing query...", expanded=True)
         notice_ph = st.empty()
         resp_ph = st.empty()
 
@@ -705,10 +708,9 @@ def render_user_page():
         metrics_md = ""
         final_mode = "grounded_rag"
 
-        # 1. Resolve Effective Provider & API Key
         active_prov, active_key, key_src = resolve_effective_provider_and_key()
 
-        # 2. Catalog Lookup Interceptor
+        # 1. Document Inventory Interceptor
         catalog_patterns = [
             r"which (all )?(notes|docs|documents|files|pdfs)",
             r"what (notes|docs|files) (do we have|exist)",
@@ -736,11 +738,12 @@ def render_user_page():
               "role": "assistant",
               "content": summary,
               "mode": "catalog",
-              "query_preview": prompt[:40] + "...",
+              "metrics_md": "",
+              "query_preview": prompt[:35] + "...",
           })
           st.rerun()
 
-        # 3. Contextualization & Sub-Queries
+        # 2. Contextualization & Sub-Queries
         status_box.update(label="🧠 Expanding query intent...", state="running")
         standalone_query = contextualize_pronouns(
             st.session_state.user_messages[:-1], prompt, active_prov, active_key
@@ -755,7 +758,7 @@ def render_user_page():
           )
           st.stop()
 
-        # 4. Hybrid Search & Neural Re-Ranking
+        # 3. Hybrid Search & Neural Re-Ranking
         status_box.update(
             label="🔍 Hybrid search & Cross-Encoder ranking...", state="running"
         )
@@ -788,7 +791,7 @@ def render_user_page():
             ]
         )
 
-        # 5. Adaptive Generation with Guaranteed Extractive Fallback
+        # 4. Adaptive Generation & Extractive Fallback
         t_gen = time.time()
         generation_succeeded = False
 
@@ -860,7 +863,7 @@ def render_user_page():
             )
             full_response = ""
 
-        # PATH: Extractive Fallback (No key or LLM error)
+        # PATH: Extractive Fallback (No key or LLM failure)
         if not generation_succeeded:
           final_mode = "extractive_fallback"
           status_box.update(
@@ -870,8 +873,7 @@ def render_user_page():
           if active_key:
             notice_ph.warning(
                 "⚠️ **LLM Connection Alert:** Cloud generation encountered an"
-                " issue. Displaying direct verified passages from your"
-                " documents below."
+                " issue. Displaying direct verified passages from documents."
             )
           else:
             notice_ph.info(
@@ -909,7 +911,7 @@ def render_user_page():
 
           gen_time = 0.0
 
-        # 6. Build Grounding Audit String for Right-Side Panel
+        # 5. Build Always-Available Grounding Audit Card
         if max_confidence >= 0.15:
           ranked_idx = [
               i
@@ -949,17 +951,24 @@ def render_user_page():
 - **Confidence:** `{s['confidence']}` | **Attention Logit:** `{s['raw_logit']}`
 - **Cited Excerpt:** *"{s['excerpt']}"*
 """
+        else:
+          metrics_md = f"""### 🎯 Grounding Audit
+**Answer Confidence:** `< 15%` (🔴 Low Document Match)
 
-        # Record to chat session
+**⏱️ Latency:** Retrieval: `{round(ret_time * 1000, 1)}ms` | Re-Ranking: `{round(rr_time * 1000, 1)}ms` | Generation: `{round(gen_time, 2)}s`
+
+*Note: No passage met the relevance threshold. Fallback mode was utilized.*"""
+
+        # Append to message history
         st.session_state.user_messages.append({
             "role": "assistant",
             "content": full_response,
             "mode": final_mode,
             "metrics_md": metrics_md,
-            "query_preview": prompt[:40] + ("..." if len(prompt) > 40 else ""),
+            "query_preview": prompt[:35] + ("..." if len(prompt) > 35 else ""),
         })
 
-        # Instant rerun to display parallel citations card in right column
+        # Instant rerun to refresh both columns simultaneously
         st.rerun()
 
 
@@ -973,7 +982,6 @@ def render_admin_page():
   if "admin_logged_in" not in st.session_state:
     st.session_state.admin_logged_in = False
 
-  # Admin Authentication Gate
   if not st.session_state.admin_logged_in:
     st.subheader("🔐 Admin Access Verification")
     entered_pass = st.text_input(

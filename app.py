@@ -1,8 +1,10 @@
 import io
+import json
 import logging
 import os
 import re
 import time
+import urllib.request
 import uuid
 import chromadb
 from chromadb.api.types import Documents, EmbeddingFunction, Embeddings
@@ -16,6 +18,54 @@ from sentence_transformers import CrossEncoder, SentenceTransformer
 import streamlit as st
 
 logger = logging.getLogger("EnterpriseRAG")
+
+
+# -------------------------------------------------------------
+# Dynamic Auto-Free Model Discovery for OpenRouter
+# -------------------------------------------------------------
+@st.cache_data(ttl=300, show_spinner=False)
+def get_dynamic_free_models() -> list:
+  """Fetches all currently active 100% free models directly from OpenRouter's live API."""
+  try:
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/models",
+        headers={"User-Agent": "EnterpriseRAG/1.0"},
+    )
+    with urllib.request.urlopen(req, timeout=4.0) as resp:
+      if resp.status == 200:
+        data = json.loads(resp.read().decode())
+        models = data.get("data", [])
+
+        # Filter strictly for free tier endpoints (free suffix or 0-cost pricing)
+        free_slugs = []
+        for m in models:
+          model_id = m.get("id", "")
+          pricing = m.get("pricing", {})
+          is_zero_cost = (
+              str(pricing.get("prompt", "")).strip() in ["0", "0.0"]
+              and str(pricing.get("completion", "")).strip() in ["0", "0.0"]
+          )
+          if model_id.endswith(":free") or is_zero_cost:
+            # Exclude non-text/reranker models
+            if not any(
+                bad in model_id.lower()
+                for bad in ["rerank", "embed", "guard", "moderation"]
+            ):
+              free_slugs.append(model_id)
+
+        if free_slugs:
+          return free_slugs
+  except Exception as e:
+    logger.warning(f"Could not reach OpenRouter models API: {e}")
+
+  # Resilient generic fallback slugs if network lookup fails
+  return [
+      "google/gemini-2.0-flash-exp:free",
+      "meta-llama/llama-3.2-3b-instruct:free",
+      "meta-llama/llama-3.1-8b-instruct:free",
+      "mistralai/mistral-7b-instruct:free",
+  ]
+
 
 # -------------------------------------------------------------
 # Streamlit Page Setup
@@ -60,7 +110,6 @@ def load_neural_models():
   chroma_client = chromadb.Client()
   embed_fn = FastEmbedding(embedder)
 
-  # Safe initialization: Never crashes on existing collection
   collection = chroma_client.get_or_create_collection(
       name="general_knowledge_base",
       embedding_function=embed_fn,
@@ -178,7 +227,6 @@ def hybrid_search(
 
   candidates = {}
   for sq in sub_queries:
-    # Dense Vector Search
     try:
       res = collection.query(
           query_texts=[sq],
@@ -205,7 +253,6 @@ def hybrid_search(
     except Exception as e:
       logger.warning(f"Vector search warning: {e}")
 
-    # Sparse BM25 Search
     if bm25_data["bm25"]:
       tokens = re.findall(r"\w+", sq.lower())
       scores = bm25_data["bm25"].get_scores(tokens)
@@ -264,22 +311,28 @@ def contextualize_pronouns(
       model = genai.GenerativeModel("gemini-1.5-flash")
       res = model.generate_content(prompt)
       return res.text.strip().strip('"')
-    elif provider in ["openai", "openrouter"] and api_key:
-      base_url = (
-          "https://openrouter.ai/api/v1" if provider == "openrouter" else None
-      )
-      client = openai.OpenAI(api_key=api_key, base_url=base_url)
-      model_name = (
-          "gpt-4o-mini"
-          if provider == "openai"
-          else "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
-      )
+    elif provider == "openai" and api_key:
+      client = openai.OpenAI(api_key=api_key)
       res = client.chat.completions.create(
-          model=model_name,
+          model="gpt-4o-mini",
           messages=[{"role": "user", "content": prompt}],
           max_tokens=60,
       )
       return res.choices[0].message.content.strip().strip('"')
+    elif provider == "openrouter" and api_key:
+      client = openai.OpenAI(
+          api_key=api_key, base_url="https://openrouter.ai/api/v1"
+      )
+      for model_name in get_dynamic_free_models():
+        try:
+          res = client.chat.completions.create(
+              model=model_name,
+              messages=[{"role": "user", "content": prompt}],
+              max_tokens=60,
+          )
+          return res.choices[0].message.content.strip().strip('"')
+        except Exception:
+          continue
   except Exception:
     return latest_query
   return latest_query
@@ -290,8 +343,8 @@ def stream_llm(
 ):
   if not api_key:
     yield (
-        "⚠️ **Error:** Missing API Key. Please provide a valid API key in the"
-        " sidebar configuration."
+        "⚠️ **Error:** Missing API Key. Please enter your API key in the sidebar"
+        " configuration."
     )
     return
 
@@ -306,18 +359,10 @@ def stream_llm(
         if chunk.text:
           yield chunk.text
 
-    elif provider in ["openai", "openrouter"]:
-      base_url = (
-          "https://openrouter.ai/api/v1" if provider == "openrouter" else None
-      )
-      client = openai.OpenAI(api_key=api_key, base_url=base_url)
-      model_name = (
-          "gpt-4o-mini"
-          if provider == "openai"
-          else "nvidia/llama-nemotron-rerank-vl-1b-v2:free"
-      )
+    elif provider == "openai":
+      client = openai.OpenAI(api_key=api_key)
       stream = client.chat.completions.create(
-          model=model_name,
+          model="gpt-4o-mini",
           messages=[
               {"role": "system", "content": system_prompt},
               {"role": "user", "content": user_prompt},
@@ -328,6 +373,42 @@ def stream_llm(
       for chunk in stream:
         if chunk.choices[0].delta.content:
           yield chunk.choices[0].delta.content
+
+    elif provider == "openrouter":
+      client = openai.OpenAI(
+          api_key=api_key, base_url="https://openrouter.ai/api/v1"
+      )
+      live_free_models = get_dynamic_free_models()
+      streamed = False
+
+      # Try each live free model in priority order
+      for candidate_model in live_free_models:
+        try:
+          stream = client.chat.completions.create(
+              model=candidate_model,
+              messages=[
+                  {"role": "system", "content": system_prompt},
+                  {"role": "user", "content": user_prompt},
+              ],
+              temperature=0.2,
+              stream=True,
+          )
+          for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+              yield chunk.choices[0].delta.content
+              streamed = True
+          if streamed:
+            break
+        except Exception as model_err:
+          logger.warning(
+              f"OpenRouter free candidate [{candidate_model}] unavailable:"
+              f" {model_err}"
+          )
+          continue
+
+      if not streamed:
+        yield "\n\n❌ **OpenRouter Auto-Free Error:** All currently active free models failed to respond. Please verify your OpenRouter API key or switch to Gemini."
+
   except Exception as e:
     yield f"\n\n❌ **API Error ({provider}):** {str(e)}"
 
@@ -357,7 +438,16 @@ with st.sidebar:
   st.title("⚙️ Control Center")
 
   provider = st.selectbox(
-      "LLM Provider", ["openrouter", "gemini", "openai"], index=0
+      "LLM Provider",
+      ["openrouter", "gemini", "openai"],
+      index=0,
+      format_func=lambda x: "OpenRouter (Auto Free Router)"
+      if x == "openrouter"
+      else (
+          "Google Gemini (gemini-1.5-flash)"
+          if x == "gemini"
+          else "OpenAI (gpt-4o-mini)"
+      ),
   )
   api_key = st.text_input(
       f"{provider.capitalize()} API Key",
@@ -413,7 +503,7 @@ with st.sidebar:
   )
 
   if st.button("Process & Index", use_container_width=True) and uploaded_files:
-    splitter = RecursiveCharacterTextSplitter.from_tiktoken_encoder(
+    splitter = RecursiveCharacterTextSplitter(
         chunk_size=512, chunk_overlap=64
     )
     indexed_count = 0
@@ -424,7 +514,6 @@ with st.sidebar:
         file_bytes = f.read()
         file_size = len(file_bytes)
 
-        # Duplicate check: same filename and identical size
         if (
             f.name in current_inventory
             and current_inventory[f.name]["file_size"] == file_size
@@ -435,7 +524,6 @@ with st.sidebar:
           skipped_files.append(f.name)
           continue
 
-        # If file exists but size changed, delete old chunks first
         if f.name in current_inventory:
           st.write(f"🔄 **Updating modified file:** `{f.name}`...")
           try:

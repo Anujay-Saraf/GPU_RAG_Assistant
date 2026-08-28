@@ -20,7 +20,7 @@ import streamlit as st
 logger = logging.getLogger("EnterpriseRAG")
 
 # -------------------------------------------------------------
-# Global Page Configuration & Wide Screen Styling
+# Global Page Configuration & Full-Width Styling
 # -------------------------------------------------------------
 st.set_page_config(
     page_title="Enterprise Intelligence Portal",
@@ -29,28 +29,45 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS to expand chat container width and improve readability
 st.markdown(
     """
     <style>
+    html {
+        scroll-behavior: smooth;
+    }
     .main .block-container {
-        padding-top: 1.5rem;
-        padding-bottom: 2rem;
-        padding-left: 2.5rem;
-        padding-right: 2.5rem;
-        max-width: 98% !important;
+        padding-top: 1.2rem;
+        padding-bottom: 2.5rem;
+        padding-left: 2rem;
+        padding-right: 2rem;
+        max-width: 99% !important;
     }
     div[data-testid="stChatMessage"] {
-        padding: 1rem 1.25rem;
-        margin-bottom: 0.75rem;
-        border-radius: 0.5rem;
+        padding: 0.8rem 1.1rem;
+        margin-bottom: 0.7rem;
+        border-radius: 0.6rem;
     }
-    .citation-card {
-        background-color: rgba(240, 242, 246, 0.08);
-        border: 1px solid rgba(200, 200, 200, 0.2);
+    .citation-side-box {
+        background-color: rgba(120, 130, 150, 0.08);
+        border: 1px solid rgba(160, 170, 190, 0.22);
         border-radius: 8px;
         padding: 12px;
-        margin-bottom: 12px;
+        margin-top: 2px;
+    }
+    .jump-to-latest {
+        display: inline-block;
+        padding: 4px 12px;
+        background: rgba(100, 110, 130, 0.15);
+        border: 1px solid rgba(150, 150, 150, 0.3);
+        border-radius: 20px;
+        font-size: 0.82rem;
+        text-decoration: none;
+        color: inherit !important;
+        transition: all 0.2s ease;
+    }
+    .jump-to-latest:hover {
+        background: rgba(100, 110, 130, 0.3);
+        border-color: rgba(200, 200, 200, 0.6);
     }
     </style>
     """,
@@ -78,7 +95,6 @@ ADMIN_PASSKEY = get_secret("ADMIN_SECRET_KEY", "admin-enterprise-key-2026")
 # -------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def get_dynamic_free_models() -> list:
-  """Queries OpenRouter API for currently active 100% free model slugs."""
   try:
     req = urllib.request.Request(
         "https://openrouter.ai/api/v1/models",
@@ -116,7 +132,7 @@ def get_dynamic_free_models() -> list:
 
 
 # -------------------------------------------------------------
-# Cached Neural Models & ChromaDB
+# Cached Neural Models & Vector Database
 # -------------------------------------------------------------
 class FastEmbedding(EmbeddingFunction[Documents]):
 
@@ -213,7 +229,6 @@ def ingest_pdf_files(
     file_bytes = f.read()
     file_size = len(file_bytes)
 
-    # Duplicate check: exact filename and byte size
     if (
         f.name in current_inventory
         and current_inventory[f.name]["file_size"] == file_size
@@ -221,7 +236,6 @@ def ingest_pdf_files(
       skipped_files.append(f.name)
       continue
 
-    # Purge existing older chunks if updated
     if f.name in current_inventory:
       try:
         collection.delete(where={"source": f.name})
@@ -298,7 +312,7 @@ def resolve_effective_provider_and_key() -> tuple[str, str, str]:
 
 
 # -------------------------------------------------------------
-# Retrieval & Query Helpers
+# Conversational Context & Multi-Turn Intent Engine
 # -------------------------------------------------------------
 ACRONYM_MAP = {
     "dsa": "Data Structures and Algorithms",
@@ -337,6 +351,91 @@ def expand_query(query: str) -> list:
       sub_queries.append(f"{main_terms[0]} concepts")
       sub_queries.append(f"{' '.join(main_terms[1:])} concepts")
   return list(dict.fromkeys(sub_queries))[:3]
+
+
+def contextualize_conversation_intent(
+    history: list, latest_query: str, provider: str, api_key: str
+) -> str:
+  if not history or len(history) < 2:
+    return latest_query
+
+  intent_triggers = [
+      " it",
+      " this",
+      " that",
+      " them",
+      " previous",
+      " above",
+      " implement it",
+      " code for it",
+      "optimize",
+      "improve",
+      "explain more",
+      "why",
+      "how about",
+      "what about",
+      "instead",
+      "second one",
+      "first one",
+      "in python",
+      "in cpp",
+      "in c++",
+      "in java",
+  ]
+  needs_context = any(t in latest_query.lower() for t in intent_triggers) or len(
+      latest_query.split()
+  ) <= 4
+
+  if not needs_context:
+    return latest_query
+
+  recent_turns = []
+  for m in history[-6:]:
+    content = m["content"][:300].replace("\n", " ")
+    recent_turns.append(f"{m['role'].upper()}: {content}")
+
+  history_str = "\n".join(recent_turns)
+  prompt = (
+      "Given this ongoing technical discussion, rewrite the user's latest"
+      " follow-up into an explicit, self-contained search query that captures"
+      " the full contextual intent and specific topics being discussed. Return"
+      " ONLY the search query.\n\n"
+      f"Discussion History:\n{history_str}\n\n"
+      f"User Follow-up: {latest_query}\n\n"
+      "Self-contained Search Query:"
+  )
+
+  try:
+    if provider == "gemini" and api_key:
+      genai.configure(api_key=api_key)
+      model = genai.GenerativeModel("gemini-1.5-flash")
+      res = model.generate_content(prompt)
+      reformulated = res.text.strip().strip('"')
+      return reformulated if len(reformulated) > 3 else latest_query
+    elif provider in ["openai", "openrouter"] and api_key:
+      base_url = (
+          "https://openrouter.ai/api/v1" if provider == "openrouter" else None
+      )
+      client = openai.OpenAI(api_key=api_key, base_url=base_url)
+      available_models = (
+          ["gpt-4o-mini"]
+          if provider == "openai"
+          else get_dynamic_free_models()
+      )
+      for model_name in available_models:
+        try:
+          res = client.chat.completions.create(
+              model=model_name,
+              messages=[{"role": "user", "content": prompt}],
+              max_tokens=60,
+          )
+          reformulated = res.choices[0].message.content.strip().strip('"')
+          return reformulated if len(reformulated) > 3 else latest_query
+        except Exception:
+          continue
+  except Exception:
+    return latest_query
+  return latest_query
 
 
 def hybrid_search(
@@ -415,72 +514,36 @@ def hybrid_search(
   return sorted_cands[:20]
 
 
-def contextualize_pronouns(
-    history: list, latest_query: str, provider: str, api_key: str
-) -> str:
-  if not history or len(history) < 2 or not api_key:
-    return latest_query
-  ambiguous = [
-      " it",
-      " this",
-      " that",
-      " them",
-      " previous",
-      " above",
-      " implement it",
-      " code for it",
-  ]
-  if not any(t in latest_query.lower() for t in ambiguous):
-    return latest_query
-
-  history_str = "\n".join(
-      [f"{m['role'].upper()}: {m['content'][:250]}" for m in history[-4:]]
-  )
-  prompt = f"Rewrite this follow-up question into a standalone search query naming the explicit subject.\nHistory:\n{history_str}\nFollow-up: {latest_query}\nStandalone Query:"
-
-  try:
-    if provider == "gemini":
-      genai.configure(api_key=api_key)
-      model = genai.GenerativeModel("gemini-1.5-flash")
-      res = model.generate_content(prompt)
-      return res.text.strip().strip('"')
-    elif provider in ["openai", "openrouter"]:
-      base_url = (
-          "https://openrouter.ai/api/v1" if provider == "openrouter" else None
-      )
-      client = openai.OpenAI(api_key=api_key, base_url=base_url)
-      available_models = (
-          ["gpt-4o-mini"]
-          if provider == "openai"
-          else get_dynamic_free_models()
-      )
-      for model_name in available_models:
-        try:
-          res = client.chat.completions.create(
-              model=model_name,
-              messages=[{"role": "user", "content": prompt}],
-              max_tokens=60,
-          )
-          return res.choices[0].message.content.strip().strip('"')
-        except Exception:
-          continue
-  except Exception:
-    return latest_query
-  return latest_query
-
-
 def stream_llm(
-    provider: str, api_key: str, system_prompt: str, user_prompt: str
+    provider: str,
+    api_key: str,
+    system_prompt: str,
+    user_prompt: str,
+    conversation_history: list = None,
 ):
   if not api_key:
     raise ValueError("No API key configured.")
+
+  messages = [{"role": "system", "content": system_prompt}]
+  if conversation_history:
+    for past_turn in conversation_history[-4:]:
+      messages.append(
+          {"role": past_turn["role"], "content": past_turn["content"]}
+      )
+  messages.append({"role": "user", "content": user_prompt})
 
   if provider == "gemini":
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(
         "gemini-1.5-flash", system_instruction=system_prompt
     )
-    response = model.generate_content(user_prompt, stream=True)
+    gemini_history = []
+    if conversation_history:
+      for past_turn in conversation_history[-4:]:
+        role = "model" if past_turn["role"] == "assistant" else "user"
+        gemini_history.append({"role": role, "parts": [past_turn["content"]]})
+    chat = model.start_chat(history=gemini_history)
+    response = chat.send_message(user_prompt, stream=True)
     for chunk in response:
       if chunk.text:
         yield chunk.text
@@ -488,13 +551,7 @@ def stream_llm(
   elif provider == "openai":
     client = openai.OpenAI(api_key=api_key)
     stream = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        temperature=0.2,
-        stream=True,
+        model="gpt-4o-mini", messages=messages, temperature=0.2, stream=True
     )
     for chunk in stream:
       if chunk.choices[0].delta.content:
@@ -511,10 +568,7 @@ def stream_llm(
       try:
         stream = client.chat.completions.create(
             model=candidate_model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
+            messages=messages,
             temperature=0.2,
             stream=True,
         )
@@ -544,15 +598,17 @@ GROUNDED_SYSTEM_PROMPT = """You are a grounded academic research assistant. Answ
 CRITICAL RULES:
 1. CITATIONS: Append source numbers [1], [2], etc., directly at the end of factual sentences.
 2. Ground your answer strictly in the facts mentioned in the context.
-3. If writing code, provide clean, runnable Python code with clear comments.
-4. Start directly with the answer/code. Do not write conversational opening phrases."""
+3. CONVERSATIONAL CONTINUITY: If this is a follow-up, maintain context from earlier in the chat.
+4. If writing code, provide clean, runnable Python code with clear comments.
+5. Start directly with the answer/code. Do not write conversational opening phrases."""
 
 GENERAL_FALLBACK_SYSTEM_PROMPT = """You are a senior AI solutions architect.
 Answer the user's technical question with precision, working code, and architectural depth.
 RULES:
 1. Provide ONE clean, working implementation in a single markdown code block.
-2. Provide a brief 3-4 line usage example. Avoid repetitive testing boilerplates.
-3. Do NOT include bracketed citation numbers like [1] or [2]."""
+2. Maintain conversational context across follow-ups and iterative questions.
+3. Provide a brief 3-4 line usage example. Avoid repetitive testing boilerplates.
+4. Do NOT include bracketed citation numbers like [1] or [2]."""
 
 
 # =============================================================
@@ -561,8 +617,6 @@ RULES:
 def render_user_page():
   if "user_messages" not in st.session_state:
     st.session_state.user_messages = []
-  if "active_audit_idx" not in st.session_state:
-    st.session_state.active_audit_idx = None
 
   # Sidebar Controls
   with st.sidebar:
@@ -658,324 +712,318 @@ def render_user_page():
       st.info("No documents currently indexed. Upload above to begin!")
 
   # -------------------------------------------------------------
-  # Spacious Layout: 75% Big Chat Screen | 25% Citations Drawer
+  # Full-Width Header
   # -------------------------------------------------------------
-  col_chat, col_citations = st.columns([3.8, 1.2], gap="medium")
-
-  # ---------------- LEFT: Expanded Full-Width Chat ----------------
-  with col_chat:
-    st.title("⚡ Knowledge Chat Workspace")
-    st.caption("Decoupled Hybrid RAG with Real-Time Neural Grounding")
-
-    for idx, msg in enumerate(st.session_state.user_messages):
-      with st.chat_message(msg["role"]):
-        if msg.get("mode") == "general_knowledge":
-          st.info(
-              "💡 **Answered from General AI Knowledge** *(Topic not found in"
-              " selected documents)*"
-          )
-        elif msg.get("mode") == "extractive_fallback":
-          st.warning(
-              "ℹ️ **Extractive Fallback Mode:** Direct verified passages from"
-              " documents."
-          )
-        st.markdown(msg["content"])
-
-        # Dynamic trigger to inspect citations in the right-side drawer
-        if msg.get("metrics_md"):
-          btn_col1, btn_col2 = st.columns([0.4, 0.6])
-          with btn_col1:
-            if st.button(
-                "🔍 Inspect Citations & Evidence",
-                key=f"cite_btn_{idx}",
-                help="Opens grounding metrics in the right inspector drawer",
-            ):
-              st.session_state.active_audit_idx = idx
-              st.rerun()
-
-  # ---------------- RIGHT: Citation Inspector Drawer ----------------
-  with col_citations:
-    st.subheader("📚 Evidence Inspector")
-
-    # Determine which citation payload to show (selected turn or latest turn)
-    assistant_turns = [
-        (i, m)
-        for i, m in enumerate(st.session_state.user_messages)
-        if m["role"] == "assistant" and m.get("metrics_md")
-    ]
-
-    active_turn_data = None
-    if st.session_state.active_audit_idx is not None and st.session_state.active_audit_idx < len(
-        st.session_state.user_messages
-    ):
-      active_turn_data = st.session_state.user_messages[
-          st.session_state.active_audit_idx
-      ]
-    elif assistant_turns:
-      # Default to the most recent turn if none explicitly clicked
-      active_turn_data = assistant_turns[-1][1]
-
-    if active_turn_data:
+  header_col1, header_col2 = st.columns([5, 1])
+  with header_col1:
+    st.title("⚡ Enterprise Knowledge Assistant")
+    st.caption("Decoupled Hybrid RAG with Synchronized In-Row Evidence Auditing")
+  with header_col2:
+    if st.session_state.user_messages:
       st.markdown(
-          f"**Focus Query:** *\"{active_turn_data.get('query_preview', 'Latest')}\"*"
-      )
-      st.markdown("---")
-      st.markdown(active_turn_data["metrics_md"])
-    else:
-      st.info(
-          "Citations and evidence audits will automatically dock here as you"
-          " query your documents."
+          '<div style="text-align: right; margin-top: 1.5rem;"><a'
+          ' href="#latest_chat_anchor" class="jump-to-latest">⬇️ Jump to'
+          " Latest</a></div>",
+          unsafe_allow_html=True,
       )
 
-  # ---------------- INPUT CONTAINER ----------------
+  # -------------------------------------------------------------
+  # Chat Conversation Stream with In-Row Split Citations
+  # -------------------------------------------------------------
+  for idx, msg in enumerate(st.session_state.user_messages):
+    if msg["role"] == "user":
+      with st.chat_message("user"):
+        st.markdown(msg["content"])
+    else:
+      with st.chat_message("assistant"):
+        # In-Row Split Grid: 68% Answer on Left | 32% Citations on Right
+        col_ans, col_cite = st.columns([0.68, 0.32], gap="medium")
+
+        with col_ans:
+          if msg.get("mode") == "general_knowledge":
+            st.info(
+                "💡 **Answered from General AI Knowledge** *(Topic not found in"
+                " selected documents)*"
+            )
+          elif msg.get("mode") == "extractive_fallback":
+            st.warning(
+                "ℹ️ **Extractive Fallback Mode:** Direct verified passages from"
+                " documents."
+            )
+          st.markdown(msg["content"])
+
+        with col_cite:
+          if msg.get("metrics_md"):
+            with st.expander(
+                "📚 Citations & Evidence",
+                expanded=msg.get("open_citations", False),
+            ):
+              st.markdown(msg["metrics_md"])
+          else:
+            st.caption("*(No citations required for this query)*")
+
+  # Anchor for quick scroll
+  st.markdown('<div id="latest_chat_anchor"></div>', unsafe_allow_html=True)
+
+  # -------------------------------------------------------------
+  # Input Container
+  # -------------------------------------------------------------
   prompt = st.chat_input("Ask a question across your indexed documents...")
 
   if prompt:
     st.session_state.user_messages.append({"role": "user", "content": prompt})
 
-    with col_chat:
-      with st.chat_message("user"):
-        st.markdown(prompt)
+    with st.chat_message("user"):
+      st.markdown(prompt)
 
-      with st.chat_message("assistant"):
-        status_box = st.status("Analyzing query...", expanded=True)
+    with st.chat_message("assistant"):
+      col_ans, col_cite = st.columns([0.68, 0.32], gap="medium")
+
+      with col_ans:
+        status_box = st.status("Analyzing intent...", expanded=True)
         notice_ph = st.empty()
         resp_ph = st.empty()
 
-        full_response = ""
-        metrics_md = ""
-        final_mode = "grounded_rag"
+      full_response = ""
+      metrics_md = ""
+      final_mode = "grounded_rag"
 
-        active_prov, active_key, key_src = resolve_effective_provider_and_key()
+      active_prov, active_key, key_src = resolve_effective_provider_and_key()
 
-        # 1. Document Inventory Interceptor
-        catalog_patterns = [
-            r"which (all )?(notes|docs|documents|files|pdfs)",
-            r"what (notes|docs|files) (do we have|exist)",
-            r"list (all )?(the )?notes",
-        ]
-        if any(re.search(p, prompt.lower()) for p in catalog_patterns):
-          inv = get_indexed_inventory()
-          if not inv:
-            summary = (
-                "The knowledge base is currently empty. Please upload PDF files"
-                " in the sidebar."
-            )
-          else:
-            lines = ["Here is the inventory of indexed documents:\n"]
-            for idx, (doc_name, dinfo) in enumerate(inv.items(), 1):
-              lines.append(
-                  f"- **[{idx}] `{doc_name}`** (~{dinfo['pages']} pages,"
-                  f" {dinfo['chunks']} chunks indexed)"
-              )
-            summary = "\n".join(lines)
-
-          status_box.update(label="✅ Inventory Resolved", state="complete")
-          resp_ph.markdown(summary)
-          st.session_state.user_messages.append({
-              "role": "assistant",
-              "content": summary,
-              "mode": "catalog",
-              "metrics_md": "",
-              "query_preview": prompt[:35] + "...",
-          })
-          st.rerun()
-
-        # 2. Contextualization & Sub-Queries
-        status_box.update(label="🧠 Expanding query intent...", state="running")
-        standalone_query = contextualize_pronouns(
-            st.session_state.user_messages[:-1], prompt, active_prov, active_key
-        )
-        sub_queries = expand_query(standalone_query)
-
-        if collection.count() == 0:
-          status_box.update(label="⚠️ Knowledge Base Empty", state="error")
-          resp_ph.error(
-              "No documents have been indexed yet. Please upload PDF files in"
-              " the sidebar."
+      # 1. Document Inventory Interceptor
+      catalog_patterns = [
+          r"which (all )?(notes|docs|documents|files|pdfs)",
+          r"what (notes|docs|files) (do we have|exist)",
+          r"list (all )?(the )?notes",
+      ]
+      if any(re.search(p, prompt.lower()) for p in catalog_patterns):
+        inv = get_indexed_inventory()
+        if not inv:
+          summary = (
+              "The knowledge base is currently empty. Please upload PDF files"
+              " in the sidebar."
           )
-          st.stop()
+        else:
+          lines = ["Here is the inventory of indexed documents:\n"]
+          for idx, (doc_name, dinfo) in enumerate(inv.items(), 1):
+            lines.append(
+                f"- **[{idx}] `{doc_name}`** (~{dinfo['pages']} pages,"
+                f" {dinfo['chunks']} chunks indexed)"
+            )
+          summary = "\n".join(lines)
 
-        # 3. Hybrid Search & Neural Re-Ranking
+        status_box.update(label="✅ Inventory Resolved", state="complete")
+        resp_ph.markdown(summary)
+        st.session_state.user_messages.append({
+            "role": "assistant",
+            "content": summary,
+            "mode": "catalog",
+            "metrics_md": "",
+            "open_citations": False,
+        })
+        st.rerun()
+
+      # 2. Conversational Intent & Contextual Reformulation
+      status_box.update(
+          label="🧠 Resolving conversational context & sub-queries...",
+          state="running",
+      )
+      standalone_query = contextualize_conversation_intent(
+          st.session_state.user_messages[:-1], prompt, active_prov, active_key
+      )
+      sub_queries = expand_query(standalone_query)
+
+      if collection.count() == 0:
+        status_box.update(label="⚠️ Knowledge Base Empty", state="error")
+        resp_ph.error(
+            "No documents have been indexed yet. Please upload PDF files in the"
+            " sidebar."
+        )
+        st.stop()
+
+      # 3. Hybrid Search & Neural Re-Ranking
+      status_box.update(
+          label="🔍 Hybrid search & Cross-Encoder ranking...", state="running"
+      )
+      t0 = time.time()
+      candidates = hybrid_search(sub_queries, selected_sources=selected_docs)
+      ret_time = time.time() - t0
+
+      t1 = time.time()
+      pairs = [[standalone_query, c["text"]] for c in candidates]
+      raw_logits = reranker.predict(pairs) if pairs else np.array([])
+      sigmoid_probs = (
+          (1.0 / (1.0 + np.exp(-raw_logits)))
+          if len(raw_logits) > 0
+          else np.array([])
+      )
+      rr_time = time.time() - t1
+
+      max_confidence = (
+          float(np.max(sigmoid_probs)) if len(sigmoid_probs) > 0 else 0.0
+      )
+      is_code = any(
+          t in prompt.lower()
+          for t in [
+              "code",
+              "implement",
+              "python",
+              "script",
+              "function",
+              "class",
+          ]
+      )
+
+      # 4. Adaptive Generation with Multi-Turn Memory & Extractive Fallback
+      t_gen = time.time()
+      generation_succeeded = False
+
+      if active_key:
         status_box.update(
-            label="🔍 Hybrid search & Cross-Encoder ranking...", state="running"
+            label=(
+                f"✍️ Streaming verified response via {active_prov.upper()}..."
+            ),
+            state="running",
         )
-        t0 = time.time()
-        candidates = hybrid_search(sub_queries, selected_sources=selected_docs)
-        ret_time = time.time() - t0
-
-        t1 = time.time()
-        pairs = [[standalone_query, c["text"]] for c in candidates]
-        raw_logits = reranker.predict(pairs) if pairs else np.array([])
-        sigmoid_probs = (
-            (1.0 / (1.0 + np.exp(-raw_logits)))
-            if len(raw_logits) > 0
-            else np.array([])
-        )
-        rr_time = time.time() - t1
-
-        max_confidence = (
-            float(np.max(sigmoid_probs)) if len(sigmoid_probs) > 0 else 0.0
-        )
-        is_code = any(
-            t in prompt.lower()
-            for t in [
-                "code",
-                "implement",
-                "python",
-                "script",
-                "function",
-                "class",
-            ]
-        )
-
-        # 4. Adaptive Generation & Extractive Fallback
-        t_gen = time.time()
-        generation_succeeded = False
-
-        if active_key:
-          status_box.update(
-              label=(
-                  f"✍️ Streaming verified response via {active_prov.upper()}..."
-              ),
-              state="running",
-          )
-          try:
-            if max_confidence < 0.15:
-              final_mode = "general_knowledge"
-              notice_ph.info(
-                  "💡 **Answered from General AI Knowledge** *(Topic not found"
-                  " in selected documents)*"
-              )
-              user_prompt = (
-                  f"Topic/Task: {standalone_query}\n\nTechnical Explanation &"
-                  " Code:"
-              )
-              for chunk in stream_llm(
-                  active_prov,
-                  active_key,
-                  GENERAL_FALLBACK_SYSTEM_PROMPT,
-                  user_prompt,
-              ):
-                full_response += chunk
-                resp_ph.markdown(full_response + "▌")
-            else:
-              ranked_idx = [
-                  i
-                  for i in sigmoid_probs.argsort()[::-1]
-                  if sigmoid_probs[i] >= 0.15
-              ][:4]
-              final_cands = [candidates[i] for i in ranked_idx]
-              context_str = "\n\n".join([
-                  f"Source [{i+1}] (from {c['meta'].get('source')}, Page"
-                  f" {c['meta'].get('page','?')}):\n{c['text']}"
-                  for i, c in enumerate(final_cands)
-              ])
-
-              user_prompt = (
-                  f"Context Sources:\n{context_str}\n\nTask: Provide clean,"
-                  " working Python code for"
-                  f" '{standalone_query}' based on context.\nInclude inline"
-                  " citations [1], [2].\n\nAnswer:"
-                  if is_code
-                  else (
-                      f"Context Sources:\n{context_str}\n\nQuestion:"
-                      f" {standalone_query}\n\nCited Answer:"
-                  )
-              )
-
-              for chunk in stream_llm(
-                  active_prov, active_key, GROUNDED_SYSTEM_PROMPT, user_prompt
-              ):
-                full_response += chunk
-                resp_ph.markdown(full_response + "▌")
-
-            gen_time = time.time() - t_gen
-            generation_succeeded = True
-            status_box.update(label="✅ Complete!", state="complete")
-            resp_ph.markdown(full_response)
-          except Exception as gen_err:
-            logger.warning(
-                f"LLM generation failed ({gen_err}). Triggering Extractive"
-                " Fallback..."
-            )
-            full_response = ""
-
-        # PATH: Extractive Fallback (No key or LLM failure)
-        if not generation_succeeded:
-          final_mode = "extractive_fallback"
-          status_box.update(
-              label="⚡ Extractive Mode (Local Neural Engine)", state="complete"
-          )
-
-          if active_key:
-            notice_ph.warning(
-                "⚠️ **LLM Connection Alert:** Cloud generation encountered an"
-                " issue. Displaying direct verified passages from documents."
-            )
-          else:
+        try:
+          if max_confidence < 0.15:
+            final_mode = "general_knowledge"
             notice_ph.info(
-                "ℹ️ **Extractive Mode:** Direct top-ranked passages verified by"
-                " local neural cross-encoder."
+                "💡 **Answered from General AI Knowledge** *(Topic not found in"
+                " selected documents)*"
             )
-
-          if max_confidence >= 0.15:
+            user_prompt = (
+                f"Topic/Task: {standalone_query}\n\nTechnical Explanation &"
+                " Code:"
+            )
+            for chunk in stream_llm(
+                active_prov,
+                active_key,
+                GENERAL_FALLBACK_SYSTEM_PROMPT,
+                user_prompt,
+                conversation_history=st.session_state.user_messages[:-1],
+            ):
+              full_response += chunk
+              resp_ph.markdown(full_response + "▌")
+          else:
             ranked_idx = [
                 i
                 for i in sigmoid_probs.argsort()[::-1]
                 if sigmoid_probs[i] >= 0.15
             ][:4]
-            lines = [
-                f"### 📖 Relevant Excerpts for: *\"{standalone_query}\"*\n"
-            ]
-            for rank, i in enumerate(ranked_idx, 1):
-              c = candidates[i]
-              src = c["meta"].get("source", "Document")
-              pg = c["meta"].get("page", "?")
-              conf = round(float(sigmoid_probs[i]) * 100, 1)
-              lines.append(
-                  f"**[{rank}] {src} (Page {pg})** — *{conf}% relevance*\n> "
-                  + c["text"].strip().replace("\n", "\n> ")
-                  + "\n"
-              )
+            final_cands = [candidates[i] for i in ranked_idx]
+            context_str = "\n\n".join([
+                f"Source [{i+1}] (from {c['meta'].get('source')}, Page"
+                f" {c['meta'].get('page','?')}):\n{c['text']}"
+                for i, c in enumerate(final_cands)
+            ])
 
-            full_response = "\n".join(lines)
-            resp_ph.markdown(full_response)
-          else:
-            full_response = (
-                "No closely matching sections found in the selected documents."
+            user_prompt = (
+                f"Context Sources:\n{context_str}\n\nTask: Provide clean,"
+                " working Python code for"
+                f" '{standalone_query}' based on context.\nInclude inline"
+                " citations [1], [2].\n\nAnswer:"
+                if is_code
+                else (
+                    f"Context Sources:\n{context_str}\n\nQuestion:"
+                    f" {standalone_query}\n\nCited Answer:"
+                )
             )
-            resp_ph.info(full_response)
 
-          gen_time = 0.0
+            for chunk in stream_llm(
+                active_prov,
+                active_key,
+                GROUNDED_SYSTEM_PROMPT,
+                user_prompt,
+                conversation_history=st.session_state.user_messages[:-1],
+            ):
+              full_response += chunk
+              resp_ph.markdown(full_response + "▌")
 
-        # 5. Build Always-Available Grounding Audit Card
+          gen_time = time.time() - t_gen
+          generation_succeeded = True
+          status_box.update(label="✅ Complete!", state="complete")
+          resp_ph.markdown(full_response)
+        except Exception as gen_err:
+          logger.warning(
+              f"LLM generation failed ({gen_err}). Triggering Extractive"
+              " Fallback..."
+          )
+          full_response = ""
+
+      # PATH: Extractive Fallback (No key or LLM failure)
+      if not generation_succeeded:
+        final_mode = "extractive_fallback"
+        status_box.update(
+            label="⚡ Extractive Mode (Local Neural Engine)", state="complete"
+        )
+
+        if active_key:
+          notice_ph.warning(
+              "⚠️ **LLM Connection Alert:** Cloud generation encountered an"
+              " issue. Displaying direct verified passages from documents."
+          )
+        else:
+          notice_ph.info(
+              "ℹ️ **Extractive Mode:** Direct top-ranked passages verified by"
+              " local neural cross-encoder."
+          )
+
         if max_confidence >= 0.15:
           ranked_idx = [
               i
               for i in sigmoid_probs.argsort()[::-1]
               if sigmoid_probs[i] >= 0.15
           ][:4]
-          final_cands = [candidates[i] for i in ranked_idx]
-          sources_payload = [{
-              "index": i + 1,
-              "source": c["meta"].get("source"),
-              "page": c["meta"].get("page", "N/A"),
-              "confidence": f"{round(float(sigmoid_probs[ranked_idx[i]]) * 100, 1)}%",
-              "raw_logit": round(float(raw_logits[ranked_idx[i]]), 2),
-              "excerpt": c["text"][:180] + "...",
-          } for i, c in enumerate(final_cands)]
+          lines = [f"### 📖 Relevant Excerpts for: *\"{standalone_query}\"*\n"]
+          for rank, i in enumerate(ranked_idx, 1):
+            c = candidates[i]
+            src = c["meta"].get("source", "Document")
+            pg = c["meta"].get("page", "?")
+            conf = round(float(sigmoid_probs[i]) * 100, 1)
+            lines.append(
+                f"**[{rank}] {src} (Page {pg})** — *{conf}% relevance*\n> "
+                + c["text"].strip().replace("\n", "\n> ")
+                + "\n"
+            )
 
-          overall_conf = round(
-              float(
-                  np.mean([
-                      float(s["confidence"].replace("%", ""))
-                      for s in sources_payload
-                  ])
-              ),
-              1,
+          full_response = "\n".join(lines)
+          resp_ph.markdown(full_response)
+        else:
+          full_response = (
+              "No closely matching sections found in the selected documents."
           )
-          metrics_md = f"""### 🎯 Grounding Audit
+          resp_ph.info(full_response)
+
+        gen_time = 0.0
+
+      # 5. Build Grounding Audit Block
+      if max_confidence >= 0.15:
+        ranked_idx = [
+            i
+            for i in sigmoid_probs.argsort()[::-1]
+            if sigmoid_probs[i] >= 0.15
+        ][:4]
+        final_cands = [candidates[i] for i in ranked_idx]
+        sources_payload = [{
+            "index": i + 1,
+            "source": c["meta"].get("source"),
+            "page": c["meta"].get("page", "N/A"),
+            "confidence": f"{round(float(sigmoid_probs[ranked_idx[i]]) * 100, 1)}%",
+            "raw_logit": round(float(raw_logits[ranked_idx[i]]), 2),
+            "excerpt": c["text"][:160] + "...",
+        } for i, c in enumerate(final_cands)]
+
+        overall_conf = round(
+            float(
+                np.mean([
+                    float(s["confidence"].replace("%", ""))
+                    for s in sources_payload
+                ])
+            ),
+            1,
+        )
+        metrics_md = f"""### 🎯 Grounding Audit
 **Answer Confidence:** `{overall_conf}%` ({'🟢 HIGH GROUNDING' if overall_conf >= 70 else '🟡 MODERATE GROUNDING'})
 
 **⏱️ Latency:**
@@ -985,15 +1033,15 @@ def render_user_page():
 
 ### 📚 Matched Sources:
 """
-          for s in sources_payload:
-            metrics_md += f"""
+        for s in sources_payload:
+          metrics_md += f"""
 ---
 #### **Source [{s['index']}] — {s['source']} (Page {s['page']})**
 - **Confidence:** `{s['confidence']}` | **Attention Logit:** `{s['raw_logit']}`
 - **Cited Excerpt:** *"{s['excerpt']}"*
 """
-        else:
-          metrics_md = f"""### 🎯 Grounding Audit
+      else:
+        metrics_md = f"""### 🎯 Grounding Audit
 **Answer Confidence:** `< 15%` (🔴 Low Document Match)
 
 **⏱️ Latency:**
@@ -1003,18 +1051,21 @@ def render_user_page():
 
 *Note: No document section met the grounding threshold.*"""
 
-        # Append to message history & set as active inspection target
-        new_msg_idx = len(st.session_state.user_messages)
-        st.session_state.user_messages.append({
-            "role": "assistant",
-            "content": full_response,
-            "mode": final_mode,
-            "metrics_md": metrics_md,
-            "query_preview": prompt[:35] + ("..." if len(prompt) > 35 else ""),
-        })
-        st.session_state.active_audit_idx = new_msg_idx
+      # Render citation directly into the right sub-column for this turn
+      with col_cite:
+        with st.expander("📚 Citations & Evidence", expanded=True):
+          st.markdown(metrics_md)
 
-        st.rerun()
+      # Save message turn
+      st.session_state.user_messages.append({
+          "role": "assistant",
+          "content": full_response,
+          "mode": final_mode,
+          "metrics_md": metrics_md,
+          "open_citations": True,
+      })
+
+      st.rerun()
 
 
 # =============================================================

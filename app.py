@@ -20,7 +20,7 @@ import streamlit as st
 logger = logging.getLogger("EnterpriseRAG")
 
 # -------------------------------------------------------------
-# Secret Resolution Helper (Streamlit Secrets / Env Vars)
+# Secret Resolution Helper
 # -------------------------------------------------------------
 def get_secret(key: str, default: str = "") -> str:
   try:
@@ -34,30 +34,11 @@ def get_secret(key: str, default: str = "") -> str:
 ADMIN_PASSKEY = get_secret("ADMIN_SECRET_KEY", "admin-enterprise-key-2026")
 
 # -------------------------------------------------------------
-# Streamlit Page Setup & Session State
-# -------------------------------------------------------------
-st.set_page_config(
-    page_title="Enterprise Intelligence Portal", page_icon="⚡", layout="wide"
-)
-
-if "session_id" not in st.session_state:
-  st.session_state.session_id = str(uuid.uuid4())
-if "messages" not in st.session_state:
-  st.session_state.messages = []
-if "bm25_cache" not in st.session_state:
-  st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
-if "is_admin" not in st.session_state:
-  st.session_state.is_admin = False
-if "active_provider" not in st.session_state:
-  st.session_state.active_provider = get_secret("ACTIVE_PROVIDER", "openrouter")
-
-
-# -------------------------------------------------------------
 # Dynamic Auto-Free Model Discovery for OpenRouter
 # -------------------------------------------------------------
 @st.cache_data(ttl=300, show_spinner=False)
 def get_dynamic_free_models() -> list:
-  """Fetches all currently active 100% free models directly from OpenRouter's live API."""
+  """Fetches currently active free models from OpenRouter's live API."""
   try:
     req = urllib.request.Request(
         "https://openrouter.ai/api/v1/models",
@@ -67,26 +48,24 @@ def get_dynamic_free_models() -> list:
       if resp.status == 200:
         data = json.loads(resp.read().decode())
         models = data.get("data", [])
-
         free_slugs = []
         for m in models:
           model_id = m.get("id", "")
           pricing = m.get("pricing", {})
-          is_zero_cost = (
+          is_zero = (
               str(pricing.get("prompt", "")).strip() in ["0", "0.0"]
               and str(pricing.get("completion", "")).strip() in ["0", "0.0"]
           )
-          if model_id.endswith(":free") or is_zero_cost:
+          if model_id.endswith(":free") or is_zero:
             if not any(
                 bad in model_id.lower()
                 for bad in ["rerank", "embed", "guard", "moderation"]
             ):
               free_slugs.append(model_id)
-
         if free_slugs:
           return free_slugs
   except Exception as e:
-    logger.warning(f"Could not reach OpenRouter models API: {e}")
+    logger.warning(f"OpenRouter models catalog unreachable: {e}")
 
   return [
       "google/gemini-2.0-flash-exp:free",
@@ -97,7 +76,7 @@ def get_dynamic_free_models() -> list:
 
 
 # -------------------------------------------------------------
-# Cached Models & Vector Database
+# Cached Models & ChromaDB
 # -------------------------------------------------------------
 class FastEmbedding(EmbeddingFunction[Documents]):
 
@@ -139,7 +118,6 @@ embedder, reranker, chroma_client, collection, embed_fn = load_neural_models()
 # Knowledge Base State & Helpers
 # -------------------------------------------------------------
 def get_indexed_inventory():
-  """Returns a dictionary of indexed documents with page counts and file sizes."""
   try:
     all_meta = collection.get(include=["metadatas"]).get("metadatas", [])
   except Exception:
@@ -183,11 +161,8 @@ def update_bm25_index():
 
 
 def get_active_api_key(provider: str) -> str:
-  """Retrieves the active API key without exposing it to regular users."""
-  # 1. Admin session override
   if st.session_state.get(f"admin_{provider}_key"):
     return st.session_state[f"admin_{provider}_key"]
-  # 2. Streamlit Cloud Secrets / Environment Variables
   if provider == "openrouter":
     return get_secret("OPENROUTER_API_KEY")
   elif provider == "gemini":
@@ -197,9 +172,6 @@ def get_active_api_key(provider: str) -> str:
   return ""
 
 
-# -------------------------------------------------------------
-# Retrieval & Query Helpers
-# -------------------------------------------------------------
 ACRONYM_MAP = {
     "dsa": "Data Structures and Algorithms",
     "bst": "Binary Search Tree",
@@ -242,10 +214,14 @@ def expand_query(query: str) -> list:
 def hybrid_search(
     sub_queries: list, selected_sources: list = None, top_k_per_query: int = 8
 ) -> list:
-  bm25_data = st.session_state.bm25_cache
+  bm25_data = st.session_state.get(
+      "bm25_cache", {"bm25": None, "docs": [], "metas": []}
+  )
   if not bm25_data["bm25"]:
     update_bm25_index()
-    bm25_data = st.session_state.bm25_cache
+    bm25_data = st.session_state.get(
+        "bm25_cache", {"bm25": None, "docs": [], "metas": []}
+    )
 
   where_filter = None
   if selected_sources:
@@ -370,8 +346,8 @@ def stream_llm(
 ):
   if not api_key:
     yield (
-        "⚠️ **Error:** Backend API credentials not configured. Please contact"
-        " the administrator."
+        "⚠️ **Error:** Backend API credentials are not configured. Please"
+        " contact the portal administrator."
     )
     return
 
@@ -427,13 +403,12 @@ def stream_llm(
             break
         except Exception as model_err:
           logger.warning(
-              f"OpenRouter free candidate [{candidate_model}] failed:"
-              f" {model_err}"
+              f"OpenRouter candidate [{candidate_model}] failed: {model_err}"
           )
           continue
 
       if not streamed:
-        yield "\n\n❌ **Provider Error:** All free model endpoints are currently congested. Please retry in a few moments."
+        yield "\n\n❌ **Provider Congestion:** All free models are currently busy. Please retry shortly or contact the administrator."
 
   except Exception as e:
     yield f"\n\n❌ **Generation Error:** {str(e)}"
@@ -457,54 +432,335 @@ RULES:
 2. Provide a brief 3-4 line usage example. Avoid repetitive testing boilerplates.
 3. Do NOT include bracketed citation numbers like [1] or [2]."""
 
-# -------------------------------------------------------------
-# Sidebar: Role-Based Access Control (Admin vs. User Persona)
-# -------------------------------------------------------------
-with st.sidebar:
-  # Persona Status Indicator
-  if st.session_state.is_admin:
-    st.success("👑 **Admin Workspace Active**")
-  else:
-    st.info("👤 **User Mode**")
 
-  st.markdown("---")
+# =============================================================
+# ROUTE 1: USER PORTAL (/user)
+# =============================================================
+def render_user_page():
+  st.title("⚡ Enterprise Knowledge Assistant")
+  st.caption("Grounded Hybrid RAG | Multi-Document In-Memory Verification")
 
-  # 1. ADMIN MODE CONTROLS (Only visible when unlocked)
-  if st.session_state.is_admin:
-    st.subheader("⚙️ System Configuration")
+  if "user_messages" not in st.session_state:
+    st.session_state.user_messages = []
 
-    provider_options = ["openrouter", "gemini", "openai"]
+  # Sidebar: Document Selection Only (No API credentials or upload UI)
+  with st.sidebar:
+    st.subheader("📚 Available Documents")
+    current_inventory = get_indexed_inventory()
+
+    if current_inventory:
+      doc_names = list(current_inventory.keys())
+      selected_docs = st.multiselect(
+          "Filter Search Target:",
+          options=doc_names,
+          default=doc_names,
+          help="Select which indexed documents to query.",
+      )
+      for name, info in current_inventory.items():
+        size_kb = (
+            round(info["file_size"] / 1024, 1)
+            if info["file_size"] > 0
+            else "N/A"
+        )
+        st.caption(
+            f"📄 **{name}** (~{info['pages']} pgs | {info['chunks']} chunks |"
+            f" {size_kb} KB)"
+        )
+    else:
+      selected_docs = []
+      st.info("No documents are currently indexed.")
+
+  # Render Chat Messages
+  for msg in st.session_state.user_messages:
+    with st.chat_message(msg["role"]):
+      if msg.get("mode") == "general_knowledge":
+        st.info(
+            "💡 **Answered from General AI Knowledge** *(Topic not found in"
+            " selected documents)*"
+        )
+      st.markdown(msg["content"])
+      if msg.get("metrics_md"):
+        with st.expander("📚 Evidence & Verification Audit"):
+          st.markdown(msg["metrics_md"])
+
+  prompt = st.chat_input("Ask a question across indexed documents...")
+
+  if prompt:
+    st.session_state.user_messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+      st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+      status_box = st.status("Analyzing...", expanded=True)
+      notice_ph = st.empty()
+      resp_ph = st.empty()
+
+      full_response = ""
+      metrics_md = ""
+      final_mode = "grounded_rag"
+
+      active_prov = st.session_state.get(
+          "admin_active_provider", get_secret("ACTIVE_PROVIDER", "openrouter")
+      )
+      active_key = get_active_api_key(active_prov)
+
+      # 1. Catalog Lookup Check
+      catalog_patterns = [
+          r"which (all )?(notes|docs|documents|files|pdfs)",
+          r"what (notes|docs|files) (do we have|exist)",
+          r"list (all )?(the )?notes",
+      ]
+      if any(re.search(p, prompt.lower()) for p in catalog_patterns):
+        inv = get_indexed_inventory()
+        if not inv:
+          summary = "The knowledge base is currently empty."
+        else:
+          lines = ["Here is the inventory of indexed documents:\n"]
+          for idx, (doc_name, dinfo) in enumerate(inv.items(), 1):
+            lines.append(
+                f"- **[{idx}] `{doc_name}`** (~{dinfo['pages']} pages,"
+                f" {dinfo['chunks']} chunks indexed)"
+            )
+          summary = "\n".join(lines)
+
+        status_box.update(label="✅ Inventory Resolved", state="complete")
+        resp_ph.markdown(summary)
+        st.session_state.user_messages.append(
+            {"role": "assistant", "content": summary, "mode": "catalog"}
+        )
+        st.stop()
+
+      # 2. Contextualization & Sub-Query Expansion
+      status_box.update(label="🧠 Expanding query intent...", state="running")
+      standalone_query = contextualize_pronouns(
+          st.session_state.user_messages[:-1], prompt, active_prov, active_key
+      )
+      sub_queries = expand_query(standalone_query)
+
+      if collection.count() == 0:
+        status_box.update(label="⚠️ Knowledge Base Empty", state="error")
+        resp_ph.error(
+            "No documents have been indexed yet. Please notify the"
+            " administrator."
+        )
+        st.stop()
+
+      # 3. Hybrid Search & Re-Ranking
+      status_box.update(
+          label="🔍 Hybrid search & Cross-Encoder ranking...", state="running"
+      )
+      t0 = time.time()
+      candidates = hybrid_search(sub_queries, selected_sources=selected_docs)
+      ret_time = time.time() - t0
+
+      t1 = time.time()
+      pairs = [[standalone_query, c["text"]] for c in candidates]
+      raw_logits = reranker.predict(pairs) if pairs else np.array([])
+      sigmoid_probs = (
+          (1.0 / (1.0 + np.exp(-raw_logits)))
+          if len(raw_logits) > 0
+          else np.array([])
+      )
+      rr_time = time.time() - t1
+
+      max_confidence = (
+          float(np.max(sigmoid_probs)) if len(sigmoid_probs) > 0 else 0.0
+      )
+      is_code = any(
+          t in prompt.lower()
+          for t in [
+              "code",
+              "implement",
+              "python",
+              "script",
+              "function",
+              "class",
+          ]
+      )
+
+      # 4. Dual-Mode Generation
+      status_box.update(
+          label="✍️ Streaming verified response...", state="running"
+      )
+      t_gen = time.time()
+
+      if max_confidence < 0.15:
+        final_mode = "general_knowledge"
+        notice_ph.info(
+            "💡 **Answered from General AI Knowledge** *(Topic not found in"
+            " selected documents)*"
+        )
+        user_prompt = (
+            f"Topic/Task: {standalone_query}\n\nTechnical Explanation & Code:"
+        )
+
+        for chunk in stream_llm(
+            active_prov, active_key, GENERAL_FALLBACK_SYSTEM_PROMPT, user_prompt
+        ):
+          full_response += chunk
+          resp_ph.markdown(full_response + "▌")
+
+        gen_time = time.time() - t_gen
+        metrics_md = f"""**⏱️ Resolution Performance:**
+- Hybrid Search: `{round(ret_time * 1000, 1)} ms`
+- Cross-Encoder Re-Ranking: `{round(rr_time * 1000, 1)} ms`
+- Model Generation: `{round(gen_time, 2)} s`
+
+*Note: Document match was below grounding threshold. General knowledge fallback utilized.*"""
+
+      else:
+        ranked_idx = [
+            i
+            for i in sigmoid_probs.argsort()[::-1]
+            if sigmoid_probs[i] >= 0.15
+        ][:4]
+        final_cands = [candidates[i] for i in ranked_idx]
+        context_str = "\n\n".join([
+            f"Source [{i+1}] (from {c['meta'].get('source')}, Page"
+            f" {c['meta'].get('page','?')}):\n{c['text']}"
+            for i, c in enumerate(final_cands)
+        ])
+
+        if is_code:
+          user_prompt = (
+              f"Context Sources:\n{context_str}\n\nTask: Provide clean, working"
+              f" Python code for '{standalone_query}' based on"
+              " context.\nInclude inline citations [1], [2].\n\nAnswer:"
+          )
+        else:
+          user_prompt = (
+              f"Context Sources:\n{context_str}\n\nQuestion:"
+              f" {standalone_query}\n\nCited Answer:"
+          )
+
+        for chunk in stream_llm(
+            active_prov, active_key, GROUNDED_SYSTEM_PROMPT, user_prompt
+        ):
+          full_response += chunk
+          resp_ph.markdown(full_response + "▌")
+
+        gen_time = time.time() - t_gen
+
+        sources_payload = [{
+            "index": i + 1,
+            "source": c["meta"].get("source"),
+            "page": c["meta"].get("page", "N/A"),
+            "confidence": f"{round(float(sigmoid_probs[ranked_idx[i]]) * 100, 1)}%",
+            "raw_logit": round(float(raw_logits[ranked_idx[i]]), 2),
+            "excerpt": c["text"][:180] + "...",
+        } for i, c in enumerate(final_cands)]
+
+        overall_conf = round(
+            float(
+                np.mean([
+                    float(s["confidence"].replace("%", ""))
+                    for s in sources_payload
+                ])
+            ),
+            1,
+        )
+        metrics_md = f"""### 🎯 Grounding Audit
+**Answer Confidence:** `{overall_conf}%` ({'🟢 HIGH GROUNDING' if overall_conf >= 70 else '🟡 MODERATE GROUNDING'})
+
+**⏱️ Latency:** Retrieval: `{round(ret_time * 1000, 1)}ms` | Re-Ranking: `{round(rr_time * 1000, 1)}ms` | Generation: `{round(gen_time, 2)}s`
+
+### 📚 Matched Sources:
+"""
+        for s in sources_payload:
+          metrics_md += f"""
+---
+#### **Source [{s['index']}] — {s['source']} (Page {s['page']})**
+- **Confidence:** `{s['confidence']}` | **Attention Logit:** `{s['raw_logit']}`
+- **Cited Excerpt:** *"{s['excerpt']}"*
+"""
+
+      status_box.update(label="✅ Complete!", state="complete")
+      resp_ph.markdown(full_response)
+
+      if metrics_md:
+        with st.expander(
+            "📚 Evidence & Verification Audit",
+            expanded=(final_mode == "grounded_rag"),
+        ):
+          st.markdown(metrics_md)
+
+      st.session_state.user_messages.append({
+          "role": "assistant",
+          "content": full_response,
+          "mode": final_mode,
+          "metrics_md": metrics_md,
+      })
+
+
+# =============================================================
+# ROUTE 2: ADMIN CONSOLE (/admin)
+# =============================================================
+def render_admin_page():
+  st.title("👑 Admin Management Console")
+  st.caption("Secure Control Center | Document Ingestion & Provider Routing")
+
+  if "admin_logged_in" not in st.session_state:
+    st.session_state.admin_logged_in = False
+
+  # Admin Authentication Gate
+  if not st.session_state.admin_logged_in:
+    st.subheader("🔐 Admin Access Verification")
+    entered_pass = st.text_input(
+        "Enter Master Passkey", type="password", key="admin_auth_key"
+    )
+    if st.button("Unlock Admin Portal", use_container_width=True):
+      if entered_pass == ADMIN_PASSKEY:
+        st.session_state.admin_logged_in = True
+        st.success("Authentication successful.")
+        st.rerun()
+      else:
+        st.error("Invalid passkey.")
+    return
+
+  # Authenticated Admin Interface
+  col_a, col_b = st.columns([4, 1])
+  with col_b:
+    if st.button("🔒 Logout Admin", use_container_width=True):
+      st.session_state.admin_logged_in = False
+      st.rerun()
+
+  tab1, tab2 = st.tabs(
+      ["⚙️ Provider & Credentials", "📤 Document Ingestion & Database"]
+  )
+
+  with tab1:
+    st.subheader("LLM Provider Configuration")
+    providers = ["openrouter", "gemini", "openai"]
     provider_labels = {
-        "openrouter": "OpenRouter (Auto Free)",
+        "openrouter": "OpenRouter (Auto Free Router)",
         "gemini": "Google Gemini (gemini-1.5-flash)",
         "openai": "OpenAI (gpt-4o-mini)",
     }
-    st.session_state.active_provider = st.selectbox(
-        "Active LLM Provider",
-        provider_options,
-        index=provider_options.index(st.session_state.active_provider)
-        if st.session_state.active_provider in provider_options
-        else 0,
+    cur_prov = st.session_state.get(
+        "admin_active_provider", get_secret("ACTIVE_PROVIDER", "openrouter")
+    )
+    selected_prov = st.selectbox(
+        "Global Active Provider",
+        providers,
+        index=providers.index(cur_prov) if cur_prov in providers else 0,
         format_func=lambda x: provider_labels.get(x, x),
     )
+    st.session_state.admin_active_provider = selected_prov
 
     override_key = st.text_input(
-        f"{st.session_state.active_provider.capitalize()} API Key Override",
+        f"{selected_prov.capitalize()} Custom API Key",
         type="password",
-        value=st.session_state.get(
-            f"admin_{st.session_state.active_provider}_key", ""
-        ),
-        help="Leave empty to use default secrets/environment variables.",
+        value=st.session_state.get(f"admin_{selected_prov}_key", ""),
+        help="Leave empty to use background Streamlit Secrets.",
     )
     if override_key:
-      st.session_state[
-          f"admin_{st.session_state.active_provider}_key"
-      ] = override_key
+      st.session_state[f"admin_{selected_prov}_key"] = override_key
+      st.success("Key applied for this active session.")
 
-    st.markdown("---")
-    st.subheader("📤 Document Management")
+  with tab2:
+    st.subheader("Upload & Index Documents")
     uploaded_files = st.file_uploader(
-        "Upload PDF Documents", type=["pdf"], accept_multiple_files=True
+        "Upload PDF Files", type=["pdf"], accept_multiple_files=True
     )
 
     if (
@@ -528,7 +784,7 @@ with st.sidebar:
               and current_inventory[f.name]["file_size"] == file_size
           ):
             st.write(
-                f"⏩ **Bypassed duplicate:** `{f.name}` (Already fully indexed)"
+                f"⏩ **Bypassed duplicate:** `{f.name}` (Already indexed)"
             )
             skipped_files.append(f.name)
             continue
@@ -565,12 +821,12 @@ with st.sidebar:
             for i in range(0, len(all_chunks), batch_size):
               batch = all_chunks[i : i + batch_size]
               collection.upsert(
-                  documents=[c["text"] for c in batch],
-                  metadatas=[c["meta"] for c in batch],
-                  ids=[
-                      f"{f.name}_{uuid.uuid4().hex[:8]}_{j}"
-                      for j in range(i, i + len(batch))
-                  ],
+                documents=[c["text"] for c in batch],
+                metadatas=[c["meta"] for c in batch],
+                ids=[
+                    f"{f.name}_{uuid.uuid4().hex[:8]}_{j}"
+                    for j in range(i, i + len(batch))
+                ],
               )
             indexed_count += len(all_chunks)
             st.write(f"✅ Indexed `{f.name}` ({len(all_chunks)} chunks)")
@@ -578,305 +834,62 @@ with st.sidebar:
         update_bm25_index()
         status_box.update(
             label=(
-                f"Done! ({indexed_count} new chunks indexed,"
-                f" {len(skipped_files)} skipped)"
+                f"Completed: {indexed_count} new chunks indexed,"
+                f" {len(skipped_files)} duplicate files skipped."
             ),
             state="complete",
         )
         st.rerun()
 
-    if st.button("🗑️ Wipe Entire Database", use_container_width=True):
-      try:
-        chroma_client.delete_collection("general_knowledge_base")
-      except Exception:
-        pass
-      collection = chroma_client.get_or_create_collection(
-          name="general_knowledge_base",
-          embedding_function=embed_fn,
-          metadata={"hnsw:space": "cosine"},
-      )
-      update_bm25_index()
-      st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
-      st.success("Knowledge base cleared.")
-      st.rerun()
-
-    if st.button("🔒 Logout Admin", use_container_width=True):
-      st.session_state.is_admin = False
-      st.rerun()
-
-  # 2. USER MODE CONTROLS (What standard visitors see)
-  else:
-    st.subheader("📚 Knowledge Base")
-    current_inventory = get_indexed_inventory()
-
-    if current_inventory:
-      doc_names = list(current_inventory.keys())
-      selected_docs = st.multiselect(
-          "Filter Search Across Documents:",
-          options=doc_names,
-          default=doc_names,
-          help="Choose which documents the assistant will search against.",
-      )
-      for name, info in current_inventory.items():
+    st.markdown("---")
+    st.subheader("Current Database Inventory")
+    inv = get_indexed_inventory()
+    if inv:
+      for name, info in inv.items():
         size_kb = (
             round(info["file_size"] / 1024, 1)
             if info["file_size"] > 0
             else "N/A"
         )
-        st.caption(
-            f"📄 **{name}** (~{info['pages']} pgs | {info['chunks']} chunks |"
-            f" {size_kb} KB)"
+        st.write(
+            f"- **`{name}`** (~{info['pages']} pages | {info['chunks']} chunks"
+            f" | {size_kb} KB)"
         )
+
+      if st.button("🗑️ Wipe Entire Database", use_container_width=True):
+        try:
+          chroma_client.delete_collection("general_knowledge_base")
+        except Exception:
+          pass
+        collection = chroma_client.get_or_create_collection(
+            name="general_knowledge_base",
+            embedding_function=embed_fn,
+            metadata={"hnsw:space": "cosine"},
+        )
+        update_bm25_index()
+        st.session_state.bm25_cache = {"bm25": None, "docs": [], "metas": []}
+        st.success("Vector database cleared.")
+        st.rerun()
     else:
-      selected_docs = []
-      st.info(
-          "No documents currently indexed. Contact the administrator to load"
-          " materials."
-      )
+      st.info("Database is empty.")
 
-    st.markdown("---")
 
-    # Admin Login Expander
-    with st.expander("🔐 Admin Login"):
-      admin_input = st.text_input(
-          "Admin Passkey", type="password", key="admin_auth_box"
-      )
-      if st.button("Unlock Admin Mode", use_container_width=True):
-        if admin_input == ADMIN_PASSKEY:
-          st.session_state.is_admin = True
-          st.success("Admin mode unlocked.")
-          st.rerun()
-        else:
-          st.error("Invalid passkey.")
-
-# Ensure selected_docs exists in session for user/admin queries
-if st.session_state.is_admin:
-  inv = get_indexed_inventory()
-  selected_docs = list(inv.keys()) if inv else []
-
-# -------------------------------------------------------------
-# Main Chat Workspace
-# -------------------------------------------------------------
-st.title("⚡ Enterprise Knowledge Assistant")
-st.caption(
-    "Grounded Hybrid RAG | Multi-Document Selection | In-Memory Confidence"
-    " Audits"
+# =============================================================
+# URL ROUTER SETUP (st.navigation)
+# =============================================================
+user_page = st.Page(
+    render_user_page,
+    title="User Portal",
+    icon="💬",
+    url_path="user",
+    default=True,
+)
+admin_page = st.Page(
+    render_admin_page, title="Admin Console", icon="🔐", url_path="admin"
 )
 
-# Render Chat History
-for msg in st.session_state.messages:
-  with st.chat_message(msg["role"]):
-    if msg.get("mode") == "general_knowledge":
-      st.info(
-          "💡 **Answered from General AI Knowledge** *(Not found in selected"
-          " indexed files)*"
-      )
-    st.markdown(msg["content"])
-    if msg.get("metrics_md"):
-      with st.expander("📚 Evidence & Verification Audit"):
-        st.markdown(msg["metrics_md"])
+router = st.navigation({
+    "Portals": [user_page, admin_page],
+})
 
-prompt = st.chat_input("Ask a question across your documents...")
-
-if prompt:
-  st.session_state.messages.append({"role": "user", "content": prompt})
-  with st.chat_message("user"):
-    st.markdown(prompt)
-
-  with st.chat_message("assistant"):
-    status_box = st.status("Analyzing...", expanded=True)
-    notice_ph = st.empty()
-    resp_ph = st.empty()
-
-    full_response = ""
-    metrics_md = ""
-    final_mode = "grounded_rag"
-
-    # Resolve active credentials silently
-    active_prov = st.session_state.active_provider
-    active_key = get_active_api_key(active_prov)
-
-    # 1. Catalog / Document Inventory Check
-    catalog_patterns = [
-        r"which (all )?(notes|docs|documents|files|pdfs)",
-        r"what (notes|docs|files) (do we have|exist)",
-        r"list (all )?(the )?notes",
-    ]
-    if any(re.search(p, prompt.lower()) for p in catalog_patterns):
-      inv = get_indexed_inventory()
-      if not inv:
-        summary = "The knowledge base is currently empty."
-      else:
-        lines = ["Here is the inventory of indexed documents:\n"]
-        for idx, (doc_name, dinfo) in enumerate(inv.items(), 1):
-          lines.append(
-              f"- **[{idx}] `{doc_name}`** (~{dinfo['pages']} pages,"
-              f" {dinfo['chunks']} chunks indexed)"
-          )
-        summary = "\n".join(lines)
-
-      status_box.update(label="✅ Inventory Resolved", state="complete")
-      resp_ph.markdown(summary)
-      st.session_state.messages.append(
-          {"role": "assistant", "content": summary, "mode": "catalog"}
-      )
-      st.stop()
-
-    # 2. Contextualization & Sub-Query Expansion
-    status_box.update(label="🧠 Expanding query intent...", state="running")
-    standalone_query = contextualize_pronouns(
-        st.session_state.messages[:-1], prompt, active_prov, active_key
-    )
-    sub_queries = expand_query(standalone_query)
-
-    if collection.count() == 0:
-      status_box.update(label="⚠️ Knowledge Base Empty", state="error")
-      resp_ph.error(
-          "No documents have been indexed yet. Please ask an administrator to"
-          " upload materials."
-      )
-      st.stop()
-
-    # 3. Filtered Hybrid Search & Neural Re-Ranking
-    status_box.update(
-        label="🔍 Hybrid search & Cross-Encoder ranking...", state="running"
-    )
-    t0 = time.time()
-    candidates = hybrid_search(sub_queries, selected_sources=selected_docs)
-    ret_time = time.time() - t0
-
-    t1 = time.time()
-    pairs = [[standalone_query, c["text"]] for c in candidates]
-    raw_logits = reranker.predict(pairs) if pairs else np.array([])
-    sigmoid_probs = (
-        (1.0 / (1.0 + np.exp(-raw_logits)))
-        if len(raw_logits) > 0
-        else np.array([])
-    )
-    rr_time = time.time() - t1
-
-    max_confidence = (
-        float(np.max(sigmoid_probs)) if len(sigmoid_probs) > 0 else 0.0
-    )
-    is_code = any(
-        t in prompt.lower()
-        for t in [
-            "code",
-            "implement",
-            "python",
-            "script",
-            "function",
-            "class",
-        ]
-    )
-
-    # 4. Dual-Mode Generation
-    status_box.update(label="✍️ Streaming verified response...", state="running")
-    t_gen = time.time()
-
-    if max_confidence < 0.15:
-      final_mode = "general_knowledge"
-      notice_ph.info(
-          "💡 **Answered from General AI Knowledge** *(Topic not found in"
-          " selected documents)*"
-      )
-      user_prompt = (
-          f"Topic/Task: {standalone_query}\n\nTechnical Explanation & Code:"
-      )
-
-      for chunk in stream_llm(
-          active_prov, active_key, GENERAL_FALLBACK_SYSTEM_PROMPT, user_prompt
-      ):
-        full_response += chunk
-        resp_ph.markdown(full_response + "▌")
-
-      gen_time = time.time() - t_gen
-      metrics_md = f"""**⏱️ Resolution Performance:**
-- Hybrid Search: `{round(ret_time * 1000, 1)} ms`
-- Cross-Encoder Re-Ranking: `{round(rr_time * 1000, 1)} ms`
-- Model Generation: `{round(gen_time, 2)} s`
-
-*Note: Selected documents did not meet relevance threshold. Fallback domain generation used.*"""
-
-    else:
-      ranked_idx = [
-          i
-          for i in sigmoid_probs.argsort()[::-1]
-          if sigmoid_probs[i] >= 0.15
-      ][:4]
-      final_cands = [candidates[i] for i in ranked_idx]
-      context_str = "\n\n".join([
-          f"Source [{i+1}] (from {c['meta'].get('source')}, Page"
-          f" {c['meta'].get('page','?')}):\n{c['text']}"
-          for i, c in enumerate(final_cands)
-      ])
-
-      if is_code:
-        user_prompt = (
-            f"Context Sources:\n{context_str}\n\nTask: Provide clean, working"
-            f" Python code for '{standalone_query}' based on"
-            " context.\nInclude inline citations [1], [2].\n\nAnswer:"
-        )
-      else:
-        user_prompt = (
-            f"Context Sources:\n{context_str}\n\nQuestion:"
-            f" {standalone_query}\n\nCited Answer:"
-        )
-
-      for chunk in stream_llm(
-          active_prov, active_key, GROUNDED_SYSTEM_PROMPT, user_prompt
-      ):
-        full_response += chunk
-        resp_ph.markdown(full_response + "▌")
-
-      gen_time = time.time() - t_gen
-
-      sources_payload = [{
-          "index": i + 1,
-          "source": c["meta"].get("source"),
-          "page": c["meta"].get("page", "N/A"),
-          "confidence": f"{round(float(sigmoid_probs[ranked_idx[i]]) * 100, 1)}%",
-          "raw_logit": round(float(raw_logits[ranked_idx[i]]), 2),
-          "excerpt": c["text"][:180] + "...",
-      } for i, c in enumerate(final_cands)]
-
-      overall_conf = round(
-          float(
-              np.mean([
-                  float(s["confidence"].replace("%", ""))
-                  for s in sources_payload
-              ])
-          ),
-          1,
-      )
-      metrics_md = f"""### 🎯 Response Grounding Audit
-**Overall Answer Confidence:** `{overall_conf}%` ({'🟢 HIGH GROUNDING' if overall_conf >= 70 else '🟡 MODERATE GROUNDING'})
-
-**⏱️ Latency:** Retrieval: `{round(ret_time * 1000, 1)}ms` | Re-Ranking: `{round(rr_time * 1000, 1)}ms` | Generation: `{round(gen_time, 2)}s`
-
-### 📚 Matched Sources:
-"""
-      for s in sources_payload:
-        metrics_md += f"""
----
-#### **Source [{s['index']}] — {s['source']} (Page {s['page']})**
-- **Confidence:** `{s['confidence']}` | **Attention Logit:** `{s['raw_logit']}`
-- **Cited Excerpt:** *"{s['excerpt']}"*
-"""
-
-    status_box.update(label="✅ Complete!", state="complete")
-    resp_ph.markdown(full_response)
-
-    if metrics_md:
-      with st.expander(
-          "📚 Evidence & Verification Audit",
-          expanded=(final_mode == "grounded_rag"),
-      ):
-        st.markdown(metrics_md)
-
-    st.session_state.messages.append({
-        "role": "assistant",
-        "content": full_response,
-        "mode": final_mode,
-        "metrics_md": metrics_md,
-    })
+router.run()

@@ -17,3 +17,4 @@ opencv-python-headless
 rapidocr-onnxruntime
 langchain-text-splitters
 torchvision
+tiktoken

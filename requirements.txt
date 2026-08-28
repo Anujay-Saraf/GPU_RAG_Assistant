@@ -16,3 +16,4 @@ requests>=2.31.0
 opencv-python-headless
 rapidocr-onnxruntime
 langchain-text-splitters
+torchvision

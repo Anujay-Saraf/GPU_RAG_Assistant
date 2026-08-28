@@ -20,13 +20,41 @@ import streamlit as st
 logger = logging.getLogger("EnterpriseRAG")
 
 # -------------------------------------------------------------
-# Global Page Configuration
+# Global Page Configuration & Wide Screen Styling
 # -------------------------------------------------------------
 st.set_page_config(
     page_title="Enterprise Intelligence Portal",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# Custom CSS to expand chat container width and improve readability
+st.markdown(
+    """
+    <style>
+    .main .block-container {
+        padding-top: 1.5rem;
+        padding-bottom: 2rem;
+        padding-left: 2.5rem;
+        padding-right: 2.5rem;
+        max-width: 98% !important;
+    }
+    div[data-testid="stChatMessage"] {
+        padding: 1rem 1.25rem;
+        margin-bottom: 0.75rem;
+        border-radius: 0.5rem;
+    }
+    .citation-card {
+        background-color: rgba(240, 242, 246, 0.08);
+        border: 1px solid rgba(200, 200, 200, 0.2);
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -88,7 +116,7 @@ def get_dynamic_free_models() -> list:
 
 
 # -------------------------------------------------------------
-# Cached Neural Models & Vector Database
+# Cached Neural Models & ChromaDB
 # -------------------------------------------------------------
 class FastEmbedding(EmbeddingFunction[Documents]):
 
@@ -185,6 +213,7 @@ def ingest_pdf_files(
     file_bytes = f.read()
     file_size = len(file_bytes)
 
+    # Duplicate check: exact filename and byte size
     if (
         f.name in current_inventory
         and current_inventory[f.name]["file_size"] == file_size
@@ -192,6 +221,7 @@ def ingest_pdf_files(
       skipped_files.append(f.name)
       continue
 
+    # Purge existing older chunks if updated
     if f.name in current_inventory:
       try:
         collection.delete(where={"source": f.name})
@@ -531,8 +561,10 @@ RULES:
 def render_user_page():
   if "user_messages" not in st.session_state:
     st.session_state.user_messages = []
+  if "active_audit_idx" not in st.session_state:
+    st.session_state.active_audit_idx = None
 
-  # Sidebar: Document Upload + BYOK Settings + Target Selector
+  # Sidebar Controls
   with st.sidebar:
     with st.expander("🔑 BYOK: Custom API Key (Optional)", expanded=False):
       st.caption("Override system credentials for your session:")
@@ -625,71 +657,77 @@ def render_user_page():
       selected_docs = []
       st.info("No documents currently indexed. Upload above to begin!")
 
-  # Dual-Column Layout
-  col_chat, col_citations = st.columns([3, 2], gap="large")
+  # -------------------------------------------------------------
+  # Spacious Layout: 75% Big Chat Screen | 25% Citations Drawer
+  # -------------------------------------------------------------
+  col_chat, col_citations = st.columns([3.8, 1.2], gap="medium")
 
-  # ---------------- LEFT COLUMN: Conversational Chat ----------------
+  # ---------------- LEFT: Expanded Full-Width Chat ----------------
   with col_chat:
-    st.title("⚡ Knowledge Chat")
-    st.caption("Grounded Multi-Document RAG Workspace")
+    st.title("⚡ Knowledge Chat Workspace")
+    st.caption("Decoupled Hybrid RAG with Real-Time Neural Grounding")
 
-    chat_placeholder = st.container()
-    with chat_placeholder:
-      for msg in st.session_state.user_messages:
-        with st.chat_message(msg["role"]):
-          if msg.get("mode") == "general_knowledge":
-            st.info(
-                "💡 **Answered from General AI Knowledge** *(Not found in"
-                " selected documents)*"
-            )
-          elif msg.get("mode") == "extractive_fallback":
-            st.warning(
-                "ℹ️ **Extractive Fallback Mode:** Direct verified passages from"
-                " documents."
-            )
-          st.markdown(msg["content"])
+    for idx, msg in enumerate(st.session_state.user_messages):
+      with st.chat_message(msg["role"]):
+        if msg.get("mode") == "general_knowledge":
+          st.info(
+              "💡 **Answered from General AI Knowledge** *(Topic not found in"
+              " selected documents)*"
+          )
+        elif msg.get("mode") == "extractive_fallback":
+          st.warning(
+              "ℹ️ **Extractive Fallback Mode:** Direct verified passages from"
+              " documents."
+          )
+        st.markdown(msg["content"])
 
-          # Wrapped Citations (collapsed by default until opened)
-          if msg.get("metrics_md"):
-            with st.expander("📚 View Citations & Evidence", expanded=False):
-              st.markdown(msg["metrics_md"])
+        # Dynamic trigger to inspect citations in the right-side drawer
+        if msg.get("metrics_md"):
+          btn_col1, btn_col2 = st.columns([0.4, 0.6])
+          with btn_col1:
+            if st.button(
+                "🔍 Inspect Citations & Evidence",
+                key=f"cite_btn_{idx}",
+                help="Opens grounding metrics in the right inspector drawer",
+            ):
+              st.session_state.active_audit_idx = idx
+              st.rerun()
 
-  # ---------------- RIGHT COLUMN: Parallel Citations Inspector ----------------
+  # ---------------- RIGHT: Citation Inspector Drawer ----------------
   with col_citations:
-    st.title("📚 Live Citations & Evidence")
-    st.caption("Document Grounding Audits (Wrapped by Default)")
+    st.subheader("📚 Evidence Inspector")
 
+    # Determine which citation payload to show (selected turn or latest turn)
     assistant_turns = [
-        m
-        for m in st.session_state.user_messages
+        (i, m)
+        for i, m in enumerate(st.session_state.user_messages)
         if m["role"] == "assistant" and m.get("metrics_md")
     ]
-    if not assistant_turns:
+
+    active_turn_data = None
+    if st.session_state.active_audit_idx is not None and st.session_state.active_audit_idx < len(
+        st.session_state.user_messages
+    ):
+      active_turn_data = st.session_state.user_messages[
+          st.session_state.active_audit_idx
+      ]
+    elif assistant_turns:
+      # Default to the most recent turn if none explicitly clicked
+      active_turn_data = assistant_turns[-1][1]
+
+    if active_turn_data:
+      st.markdown(
+          f"**Focus Query:** *\"{active_turn_data.get('query_preview', 'Latest')}\"*"
+      )
+      st.markdown("---")
+      st.markdown(active_turn_data["metrics_md"])
+    else:
       st.info(
-          "Citations and evidence audits will populate here in parallel as you"
+          "Citations and evidence audits will automatically dock here as you"
           " query your documents."
       )
-    else:
-      # Most recent question's citation is ready for user exploration
-      latest_turn = assistant_turns[-1]
-      st.markdown(
-          f"#### Latest Query: *\"{latest_turn.get('query_preview', 'Latest')}\"*"
-      )
-      with st.expander(
-          "🔍 Inspect Evidence & Neural Confidence", expanded=False
-      ):
-        st.markdown(latest_turn["metrics_md"])
 
-      # Collapsed history of earlier turns
-      if len(assistant_turns) > 1:
-        st.markdown("---")
-        st.markdown("##### 📜 Previous Query Audits")
-        for idx, turn in enumerate(reversed(assistant_turns[:-1]), 1):
-          q_prev = turn.get("query_preview", f"Turn #{len(assistant_turns)-idx}")
-          with st.expander(f"Audit: {q_prev}", expanded=False):
-            st.markdown(turn["metrics_md"])
-
-  # ---------------- CHAT INPUT HANDLING ----------------
+  # ---------------- INPUT CONTAINER ----------------
   prompt = st.chat_input("Ask a question across your indexed documents...")
 
   if prompt:
@@ -940,7 +978,10 @@ def render_user_page():
           metrics_md = f"""### 🎯 Grounding Audit
 **Answer Confidence:** `{overall_conf}%` ({'🟢 HIGH GROUNDING' if overall_conf >= 70 else '🟡 MODERATE GROUNDING'})
 
-**⏱️ Latency:** Retrieval: `{round(ret_time * 1000, 1)}ms` | Re-Ranking: `{round(rr_time * 1000, 1)}ms` | Generation: `{round(gen_time, 2)}s`
+**⏱️ Latency:**
+- Retrieval: `{round(ret_time * 1000, 1)} ms`
+- Re-Ranking: `{round(rr_time * 1000, 1)} ms`
+- Generation: `{round(gen_time, 2)} s`
 
 ### 📚 Matched Sources:
 """
@@ -955,11 +996,15 @@ def render_user_page():
           metrics_md = f"""### 🎯 Grounding Audit
 **Answer Confidence:** `< 15%` (🔴 Low Document Match)
 
-**⏱️ Latency:** Retrieval: `{round(ret_time * 1000, 1)}ms` | Re-Ranking: `{round(rr_time * 1000, 1)}ms` | Generation: `{round(gen_time, 2)}s`
+**⏱️ Latency:**
+- Retrieval: `{round(ret_time * 1000, 1)} ms`
+- Re-Ranking: `{round(rr_time * 1000, 1)} ms`
+- Generation: `{round(gen_time, 2)} s`
 
-*Note: No passage met the relevance threshold. Fallback mode was utilized.*"""
+*Note: No document section met the grounding threshold.*"""
 
-        # Append to message history
+        # Append to message history & set as active inspection target
+        new_msg_idx = len(st.session_state.user_messages)
         st.session_state.user_messages.append({
             "role": "assistant",
             "content": full_response,
@@ -967,8 +1012,8 @@ def render_user_page():
             "metrics_md": metrics_md,
             "query_preview": prompt[:35] + ("..." if len(prompt) > 35 else ""),
         })
+        st.session_state.active_audit_idx = new_msg_idx
 
-        # Instant rerun to refresh both columns simultaneously
         st.rerun()
 
 
